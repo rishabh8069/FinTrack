@@ -7,7 +7,8 @@ import dotenv from 'dotenv';
 import { INITIAL_BUSINESS_INFO, INITIAL_CLIENTS, INITIAL_TRANSACTIONS, INITIAL_CHAT_MESSAGES } from './src/data/initialData.ts';
 import { connectDatabase, loadApplicationData, persistApplicationData } from './server/db.ts';
 import { Transaction, Client, ChatMessage, ReceiptScanResult, IncomeCategory, ExpenseCategory } from './src/types.ts';
-
+import { UserModel } from './server/models/User';
+import authRouter from './server/routes/auth';
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
@@ -395,6 +396,9 @@ async function startServer() {
   app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', database: databaseConnected ? 'mongodb' : 'in-memory', time: new Date().toISOString() });
   });
+
+  // Authentication routes
+  app.use('/api/auth', authRouter);
 
   // API: Get Full Application Data
   app.get('/api/data', (req, res) => {
