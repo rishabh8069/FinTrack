@@ -1,0 +1,6 @@
+{
+  "name": "FinTrack",
+  "description": "WhatsApp-Integrated Finance Tracker with natural language transaction logging, client ledgers, business expense tracking, receipt & UPI screenshot scanning, and AI financial assistance.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
