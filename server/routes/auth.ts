@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { UserModel } from '../models/User';
+import { generateToken } from '../utils/jwt';
 
 const router = Router();
 
@@ -80,9 +81,22 @@ router.post('/verify-otp', async (req, res) => {
 
         otpStore.delete(whatsappNumber);
 
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: 'User not found',
+            });
+        }
+
+        const token = generateToken({
+            userId: user._id.toString(),
+            whatsappNumber: user.whatsappNumber,
+        });
+
         return res.json({
             success: true,
             message: 'WhatsApp number verified successfully',
+            token,
             user,
         });
 
