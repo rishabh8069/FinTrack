@@ -5,6 +5,7 @@ export interface IUser extends Document {
     whatsappVerified: boolean;
     verificationStatus: 'pending' | 'verified';
     onboardingCompleted: boolean;
+    businessId: string | null;
 
     profile: {
         name: string;
@@ -41,6 +42,12 @@ const userSchema = new Schema<IUser>(
         onboardingCompleted: {
             type: Boolean,
             default: false,
+        },
+
+        businessId: {
+            type: String,
+            default: null,
+            index: true,
         },
 
         profile: {
