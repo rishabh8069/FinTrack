@@ -1,29 +1,39 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
-import dotenv from 'dotenv';
+import mongoose from 'mongoose';
+
 import { INITIAL_BUSINESS_INFO, INITIAL_CLIENTS, INITIAL_TRANSACTIONS, INITIAL_CHAT_MESSAGES } from './src/data/initialData.ts';
-import { connectDatabase, loadApplicationData, persistApplicationData } from './server/db.ts';
-import { Transaction, Client, ChatMessage, ReceiptScanResult, IncomeCategory, ExpenseCategory } from './src/types.ts';
+import { connectDatabase, loadApplicationData, seedDatabase, stripMongoFields } from './server/db.ts';
+import { DEMO_BUSINESS_ID } from './server/constants.ts';
+import { Transaction, Client, ChatMessage, ReceiptScanResult, IncomeCategory, ExpenseCategory, BusinessInfo } from './src/types.ts';
 import { UserModel } from './server/models/User';
+import { BusinessModel } from './server/models/Business';
+import { ClientModel } from './server/models/Client';
+import { TransactionModel } from './server/models/Transaction';
+import { ChatMessageModel } from './server/models/ChatMessage';
 import authRouter from './server/routes/auth';
-dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// In-memory data store with state preservation
-let businessInfo = { ...INITIAL_BUSINESS_INFO };
-let clients: Client[] = JSON.parse(JSON.stringify(INITIAL_CLIENTS));
-let transactions: Transaction[] = JSON.parse(JSON.stringify(INITIAL_TRANSACTIONS));
-let chatMessages: ChatMessage[] = JSON.parse(JSON.stringify(INITIAL_CHAT_MESSAGES));
 let databaseConnected = false;
 
-async function persistState() {
-  if (!databaseConnected) return;
-  await persistApplicationData(businessInfo, clients, transactions, chatMessages);
+// Helper: Resolve dynamic businessId from header, query, or body (no silent common fallback)
+function getBusinessId(req: express.Request): string | null {
+  const fromHeader = req.headers['x-business-id'] as string;
+  const fromQuery = req.query.businessId as string;
+  const fromBody = req.body?.businessId as string;
+  const bizId = fromHeader || fromQuery || fromBody;
+  if (bizId && bizId.trim()) {
+    return bizId.trim();
+  }
+  return null;
 }
 
 // Lazy / Safe Gemini initialization
@@ -42,16 +52,18 @@ function getGeminiClient(): GoogleGenAI | null {
   });
 }
 
-// Helper: Calculate client financials
-function recalculateClientLedger(clientName: string) {
-  const client = clients.find(
-    (c) => c.name.toLowerCase().trim() === clientName.toLowerCase().trim()
-  );
+// Helper: Calculate client financials directly in MongoDB for specific business
+async function recalculateClientLedger(clientName: string, businessId: string) {
+  const client = await ClientModel.findOne({
+    businessId,
+    name: { $regex: new RegExp(`^${clientName.trim()}$`, 'i') },
+  });
   if (!client) return null;
 
-  const clientTxs = transactions.filter(
-    (t) => t.clientName?.toLowerCase().trim() === clientName.toLowerCase().trim()
-  );
+  const clientTxs = await TransactionModel.find({
+    businessId,
+    clientName: { $regex: new RegExp(`^${clientName.trim()}$`, 'i') },
+  }).lean();
 
   let totalReceived = 0;
   clientTxs.forEach((t) => {
@@ -63,24 +75,22 @@ function recalculateClientLedger(clientName: string) {
   client.totalReceived = totalReceived;
   client.outstanding = Math.max(0, client.totalBilled - totalReceived);
   client.status = client.outstanding === 0 ? 'cleared' : (client.status === 'overdue' ? 'overdue' : 'active');
+  await client.save();
   return client;
 }
 
 // Helper: Extract amount, recognizing variations like "5k", "50k", "1.5 lakh", "₹5,000", etc.
 function parseAmount(text: string): number | null {
-  // Check for 'k' / 'K' (e.g. 5k -> 5000, 2.5k -> 2500)
   const kMatch = text.match(/(?:₹|rs\.?|inr)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:k|thousand)\b/i);
   if (kMatch) {
     return parseFloat(kMatch[1]) * 1000;
   }
 
-  // Check for 'lakh' / 'lac' (e.g. 1.5 lakh -> 150000)
   const lakhMatch = text.match(/(?:₹|rs\.?|inr)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:lakh|lac|l)\b/i);
   if (lakhMatch) {
     return parseFloat(lakhMatch[1]) * 100000;
   }
 
-  // Check standard numbers with or without commas (e.g. 5,000 or 5000 or ₹5000)
   const numMatch = text.match(/(?:₹|rs\.?|inr)?\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)/i);
   if (numMatch) {
     const raw = numMatch[1].replace(/,/g, '');
@@ -92,7 +102,11 @@ function parseAmount(text: string): number | null {
 }
 
 // Fallback Natural Language Parser for offline/instant mode
-function fallbackMessageParser(messageText: string): {
+function fallbackMessageParser(
+  messageText: string,
+  clients: Client[] = [],
+  transactions: Transaction[] = []
+): {
   action: 'add_transaction' | 'query_answer' | 'unknown';
   replyText: string;
   transaction?: Partial<Transaction>;
@@ -176,7 +190,6 @@ function fallbackMessageParser(messageText: string): {
   }
 
   // 4. Check for INCOME / INCOMING transactions
-  // Keywords indicating income
   const isIncomeIntent =
     lower.includes('received') ||
     lower.includes('receive') ||
@@ -225,13 +238,10 @@ function fallbackMessageParser(messageText: string): {
   const extractedAmount = parseAmount(text);
 
   if (extractedAmount && (isIncomeIntent || !isExpenseIntent)) {
-    // If it has an income keyword or if we can extract client / incoming context
     if (isIncomeIntent || (!isExpenseIntent && (lower.includes('from') || lower.includes('for') || lower.includes('client')))) {
-      // Find client name from text
       let matchedClientName: string | undefined = undefined;
       let matchedClientObj: Client | undefined = undefined;
 
-      // 1. Try matching against existing clients
       for (const client of clients) {
         const cLower = client.name.toLowerCase();
         const firstName = cLower.split(' ')[0];
@@ -242,7 +252,6 @@ function fallbackMessageParser(messageText: string): {
         }
       }
 
-      // 2. If no existing client matched, extract name from "from [Name]" or "[Name] paid"
       if (!matchedClientName) {
         const fromMatch = text.match(/(?:from|by|client)\s+([a-zA-Z\s]+?)(?:\s+for|\s+towards|\s+as|\s+₹|\s+rs|\s+[0-9]|$)/i);
         if (fromMatch && fromMatch[1].trim()) {
@@ -260,7 +269,6 @@ function fallbackMessageParser(messageText: string): {
         }
       }
 
-      // Extract description / service
       let description = '';
       const forMatch = text.match(/(?:for|towards|regarding|as)\s+(.+)$/i);
       if (forMatch && forMatch[1].trim()) {
@@ -269,7 +277,6 @@ function fallbackMessageParser(messageText: string): {
         description = matchedClientName ? `Payment received from ${matchedClientName}` : 'Business income received';
       }
 
-      // Auto-categorize income
       let category: IncomeCategory = 'Freelance Services';
       const dLower = (description + ' ' + text).toLowerCase();
       if (dLower.includes('web') || dLower.includes('site') || dLower.includes('app') || dLower.includes('frontend') || dLower.includes('backend') || dLower.includes('code')) {
@@ -307,7 +314,6 @@ function fallbackMessageParser(messageText: string): {
 
   // 5. Handle EXPENSE / OUTGOING transactions
   if (extractedAmount && (isExpenseIntent || lower.includes('on') || lower.includes('for'))) {
-    // Description extraction
     let description = '';
     const onMatch = text.match(/(?:on|for|towards|bought|purchased)\s+(.+)$/i);
     if (onMatch && onMatch[1].trim()) {
@@ -316,7 +322,6 @@ function fallbackMessageParser(messageText: string): {
       description = text.replace(/(?:spent|paid|expense|outgoing|bought|₹|rs\.?|inr|[0-9,kK])/gi, '').trim() || 'Business expense';
     }
 
-    // Auto-detect expense category
     let category: ExpenseCategory = 'Other business expenses';
     const lowerDesc = (description + ' ' + text).toLowerCase();
     if (lowerDesc.includes('box') || lowerDesc.includes('packag') || lowerDesc.includes('bubble wrap') || lowerDesc.includes('tape') || lowerDesc.includes('courier pack')) category = 'Packaging';
@@ -373,20 +378,11 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // MongoDB is optional during local UI development, but when MONGODB_URI is
-  // configured the database becomes the persistent source for the current
-  // application state. We keep the existing in-memory state shape so the
-  // frontend/API contract does not need to change during this first migration.
   databaseConnected = await connectDatabase();
   if (databaseConnected) {
-    const data = await loadApplicationData();
-    businessInfo = data.businessInfo;
-    clients = data.clients;
-    transactions = data.transactions;
-    chatMessages = data.chatMessages;
-    console.log(`[MongoDB] Loaded ${transactions.length} transactions, ${clients.length} clients and ${chatMessages.length} chat messages.`);
+    const data = await loadApplicationData(DEMO_BUSINESS_ID);
+    console.log(`[MongoDB] Database connected. Loaded ${data.transactions.length} transactions, ${data.clients.length} clients and ${data.chatMessages.length} chat messages.`);
   }
-
 
   // Middlewares
   app.use(express.json({ limit: '20mb' }));
@@ -400,56 +396,161 @@ async function startServer() {
   // Authentication routes
   app.use('/api/auth', authRouter);
 
-  // API: Get Full Application Data
-  app.get('/api/data', (req, res) => {
-    // Recalculate summary metrics
-    const currentMonth = new Date().toISOString().slice(0, 7); // e.g. "2026-08"
+  // API: Get Full Application Data (Scoped by businessId)
+  app.get('/api/data', async (req, res) => {
+    try {
+      const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
+      const data = await loadApplicationData(businessId);
+      const currentMonth = new Date().toISOString().slice(0, 7);
 
-    let totalIncome = 0;
-    let totalExpenses = 0;
-    const expenseByCategory: Record<string, number> = {};
-    const incomeByCategory: Record<string, number> = {};
+      let totalIncome = 0;
+      let totalExpenses = 0;
+      const expenseByCategory: Record<string, number> = {};
+      const incomeByCategory: Record<string, number> = {};
 
-    transactions.forEach((tx) => {
-      if (tx.type === 'income' || tx.type === 'payment_received') {
-        totalIncome += tx.amount;
-        incomeByCategory[tx.category] = (incomeByCategory[tx.category] || 0) + tx.amount;
-      } else if (tx.type === 'expense') {
-        totalExpenses += tx.amount;
-        expenseByCategory[tx.category] = (expenseByCategory[tx.category] || 0) + tx.amount;
-      }
-    });
+      data.transactions.forEach((tx) => {
+        if (tx.type === 'income' || tx.type === 'payment_received') {
+          totalIncome += tx.amount;
+          incomeByCategory[tx.category] = (incomeByCategory[tx.category] || 0) + tx.amount;
+        } else if (tx.type === 'expense') {
+          totalExpenses += tx.amount;
+          expenseByCategory[tx.category] = (expenseByCategory[tx.category] || 0) + tx.amount;
+        }
+      });
 
-    const netProfit = totalIncome - totalExpenses;
-    const profitMargin = totalIncome > 0 ? (netProfit / totalIncome) * 100 : 0;
-    const totalOutstanding = clients.reduce((sum, c) => sum + c.outstanding, 0);
+      const netProfit = totalIncome - totalExpenses;
+      const profitMargin = totalIncome > 0 ? (netProfit / totalIncome) * 100 : 0;
+      const totalOutstanding = data.clients.reduce((sum, c) => sum + c.outstanding, 0);
 
-    const monthlySummary = {
-      month: currentMonth,
-      monthName: 'August 2026',
-      totalIncome,
-      totalExpenses,
-      netProfit,
-      profitMargin,
-      totalOutstanding,
-      expenseByCategory,
-      incomeByCategory,
-      transactionCount: transactions.length,
-    };
+      const monthlySummary = {
+        month: currentMonth,
+        monthName: 'August 2026',
+        totalIncome,
+        totalExpenses,
+        netProfit,
+        profitMargin,
+        totalOutstanding,
+        expenseByCategory,
+        incomeByCategory,
+        transactionCount: data.transactions.length,
+      };
 
-    res.json({
-      businessInfo,
-      clients,
-      transactions,
-      chatMessages,
-      summary: monthlySummary,
-    });
+      res.json({
+        businessId,
+        businessInfo: data.businessInfo,
+        clients: data.clients,
+        transactions: data.transactions,
+        chatMessages: data.chatMessages,
+        summary: monthlySummary,
+      });
+    } catch (error) {
+      console.error('Error in /api/data:', error);
+      res.status(500).json({ error: 'Failed to load application data' });
+    }
   });
 
-  // API: Update Business Profile
+  // API: Create New Business Profile (Always assigns a unique businessId on creation)
+  app.post('/api/business', async (req, res) => {
+    try {
+      const { id, name, ownerName, currency = '₹', phone = '', upiId = '' } = req.body;
+
+      if (!name || !ownerName) {
+        return res.status(400).json({ error: 'Business name and owner name are required' });
+      }
+
+      // Generate a fresh unique business ID for every newly created profile unless explicit id provided
+      const businessId = id || `biz_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+
+      const createdDoc = await BusinessModel.create({
+        id: businessId,
+        name: name.trim(),
+        ownerName: ownerName.trim(),
+        currency,
+        phone,
+        upiId,
+      });
+
+      console.log('[MongoDB] Created unique business profile:', businessId);
+
+      return res.status(201).json({
+        success: true,
+        businessId,
+        businessInfo: {
+          id: businessId,
+          ...stripMongoFields<BusinessInfo>(createdDoc),
+        },
+      });
+    } catch (error) {
+      console.error('[Business] Failed to create business profile:', error);
+      return res.status(500).json({ error: 'Failed to create business profile' });
+    }
+  });
+
+  // API: Get Business Profile by ID
+  app.get('/api/business/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const businessDoc = await BusinessModel.findOne({ id }).lean();
+      if (!businessDoc) {
+        return res.status(404).json({ error: 'Business profile not found' });
+      }
+      return res.json({
+        success: true,
+        businessId: id,
+        businessInfo: {
+          id,
+          ...stripMongoFields<BusinessInfo>(businessDoc),
+        },
+      });
+    } catch (error) {
+      console.error('[Business] Failed to fetch business profile:', error);
+      return res.status(500).json({ error: 'Failed to fetch business profile' });
+    }
+  });
+
+  // API: Update Business Profile by ID
+  app.put('/api/business/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { name, ownerName, currency, phone, upiId } = req.body;
+
+      const updatedBusiness = await BusinessModel.findOneAndUpdate(
+        { id },
+        {
+          $set: {
+            ...(name && { name: name.trim() }),
+            ...(ownerName && { ownerName: ownerName.trim() }),
+            ...(currency && { currency }),
+            ...(phone !== undefined && { phone }),
+            ...(upiId !== undefined && { upiId }),
+          },
+        },
+        { new: true }
+      ).lean();
+
+      if (!updatedBusiness) {
+        return res.status(404).json({ error: 'Business profile not found' });
+      }
+
+      return res.json({
+        success: true,
+        businessId: id,
+        businessInfo: {
+          id,
+          ...stripMongoFields<BusinessInfo>(updatedBusiness),
+        },
+      });
+    } catch (error) {
+      console.error('[Business] Failed to update business profile:', error);
+      return res.status(500).json({ error: 'Failed to update business profile' });
+    }
+  });
+
+  // API: Update Active/Current Business Profile
   app.put('/api/business', async (req, res) => {
     try {
-      const { name, ownerName, currency, phone, upiId } = req.body;
+      const { id, name, ownerName, currency, phone, upiId } = req.body;
+      const targetBusinessId = id || getBusinessId(req) || DEMO_BUSINESS_ID;
 
       if (!name || !ownerName) {
         return res.status(400).json({
@@ -457,24 +558,31 @@ async function startServer() {
         });
       }
 
-      businessInfo = {
-        ...businessInfo,
-        name,
-        ownerName,
-        currency: currency || '₹',
-        phone: phone || '',
-        upiId: upiId || '',
-      };
-
-      await persistState();
+      const updatedBusiness = await BusinessModel.findOneAndUpdate(
+        { id: targetBusinessId },
+        {
+          $set: {
+            id: targetBusinessId,
+            name,
+            ownerName,
+            currency: currency || '₹',
+            phone: phone || '',
+            upiId: upiId || '',
+          },
+        },
+        { new: true, upsert: true }
+      ).lean();
 
       return res.json({
         success: true,
-        businessInfo,
+        businessId: targetBusinessId,
+        businessInfo: {
+          id: targetBusinessId,
+          ...stripMongoFields<BusinessInfo>(updatedBusiness),
+        },
       });
     } catch (error) {
       console.error('[Business] Failed to save business profile:', error);
-
       return res.status(500).json({
         error: 'Failed to save business profile',
       });
@@ -483,174 +591,285 @@ async function startServer() {
 
   // API: Reset / Seed Data
   app.post('/api/reset', async (req, res) => {
-    businessInfo = { ...INITIAL_BUSINESS_INFO };
-    clients = JSON.parse(JSON.stringify(INITIAL_CLIENTS));
-    transactions = JSON.parse(JSON.stringify(INITIAL_TRANSACTIONS));
-    chatMessages = JSON.parse(JSON.stringify(INITIAL_CHAT_MESSAGES));
-    await persistState();
+    await seedDatabase();
     res.json({ success: true, message: 'FinTrack data reset to demo defaults.' });
   });
 
-  // API: Create Manual Transaction (Web Dashboard)
+  // API: Get Transactions (Scoped by businessId)
+  app.get('/api/transactions', async (req, res) => {
+    try {
+      const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
+      const dbTransactions = await TransactionModel
+        .find({ businessId })
+        .sort({ createdAt: -1 })
+        .lean();
+
+      const transactions = dbTransactions.map((doc) => stripMongoFields<Transaction>(doc));
+
+      return res.json({
+        success: true,
+        businessId,
+        transactions,
+      });
+    } catch (error) {
+      console.error('Get transactions error:', error);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to fetch transactions',
+      });
+    }
+  });
+
+  // API: Get Single Transaction by ID (Scoped by businessId)
+  app.get('/api/transactions/:id', async (req, res) => {
+    try {
+      const transactionId = req.params.id;
+      const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
+      const isObjectId = mongoose.Types.ObjectId.isValid(transactionId);
+      const query: any = isObjectId
+        ? { businessId, $or: [{ id: transactionId }, { _id: transactionId }] }
+        : { businessId, id: transactionId };
+
+      const txDoc = await TransactionModel.findOne(query).lean();
+      if (!txDoc) {
+        return res.status(404).json({ error: 'Transaction not found' });
+      }
+
+      return res.json(stripMongoFields<Transaction>(txDoc));
+    } catch (error) {
+      console.error('Get transaction error:', error);
+      return res.status(500).json({ error: 'Failed to fetch transaction' });
+    }
+  });
+
+  // API: Create Manual Transaction (Scoped by businessId)
   app.post('/api/transactions', async (req, res) => {
-    const { type, amount, currency = '₹', clientName, clientId, category, description, date, paymentMethod = 'UPI', notes } = req.body;
+    try {
+      const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
+      const {
+        type,
+        amount,
+        currency = '₹',
+        clientName,
+        clientId,
+        category,
+        description,
+        date,
+        paymentMethod = 'UPI',
+        notes,
+      } = req.body;
 
-    if (!amount || isNaN(Number(amount))) {
-      return res.status(400).json({ error: 'Valid amount is required' });
-    }
-
-    const newTx: Transaction = {
-      id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
-      type: type || 'expense',
-      amount: Number(amount),
-      currency,
-      clientName: clientName || undefined,
-      clientId: clientId || undefined,
-      category: category || (type === 'income' ? 'Freelance Services' : 'Other business expenses'),
-      description: description || `${type === 'income' ? 'Income' : 'Expense'} entry`,
-      date: date || new Date().toISOString().split('T')[0],
-      paymentMethod,
-      notes,
-      source: 'web',
-      createdAt: new Date().toISOString(),
-    };
-
-    transactions.unshift(newTx);
-
-    console.log('[TX DEBUG] Added transaction:', newTx);
-    console.log('[TX DEBUG] Total transactions in memory:', transactions.length);
-
-    // If client is involved, update client ledger
-    if (clientName) {
-      const existingClient = clients.find((c) => c.name.toLowerCase() === clientName.toLowerCase());
-      if (existingClient) {
-        if (type === 'income' || type === 'payment_received') {
-          existingClient.totalReceived += newTx.amount;
-          existingClient.outstanding = Math.max(0, existingClient.totalBilled - existingClient.totalReceived);
-          existingClient.status = existingClient.outstanding === 0 ? 'cleared' : existingClient.status;
-        } else if (type === 'bill_raised') {
-          existingClient.totalBilled += newTx.amount;
-          existingClient.outstanding = existingClient.totalBilled - existingClient.totalReceived;
-        }
-        existingClient.lastTransactionDate = newTx.date;
+      if (!amount || isNaN(Number(amount))) {
+        return res.status(400).json({
+          success: false,
+          error: 'Valid amount is required',
+        });
       }
-    }
 
-    await persistState();
-    res.json({ success: true, transaction: newTx });
+      const newTx: any = {
+        id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+        businessId,
+        type: type || 'expense',
+        amount: Number(amount),
+        currency,
+        clientName: clientName || undefined,
+        clientId: clientId || undefined,
+        category: category || (type === 'income' ? 'Freelance Services' : 'Other business expenses'),
+        description: description || `${type === 'income' ? 'Income' : 'Expense'} entry`,
+        date: date || new Date().toISOString().split('T')[0],
+        paymentMethod,
+        notes,
+        source: 'web',
+        createdAt: new Date().toISOString(),
+      };
+
+      const savedDoc = await TransactionModel.create(newTx);
+      const savedTransaction = stripMongoFields<Transaction>(savedDoc);
+
+      if (clientName) {
+        await recalculateClientLedger(clientName, businessId);
+      }
+
+      return res.status(201).json({
+        success: true,
+        businessId,
+        transaction: savedTransaction,
+      });
+    } catch (error) {
+      console.error('Create transaction error:', error);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to create transaction',
+      });
+    }
   });
 
-  // API: Update Transaction
+  // API: Update Transaction (Scoped by businessId)
   app.put('/api/transactions/:id', async (req, res) => {
-    const { id } = req.params;
-    const index = transactions.findIndex((t) => t.id === id);
-    if (index === -1) {
-      return res.status(404).json({ error: 'Transaction not found' });
-    }
+    try {
+      const transactionId = req.params.id;
+      const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
+      const updateData = { ...req.body };
+      delete updateData.id;
+      delete updateData._id;
 
-    transactions[index] = {
-      ...transactions[index],
-      ...req.body,
-      id, // protect id
-    };
+      const isObjectId = mongoose.Types.ObjectId.isValid(transactionId);
+      const query: any = isObjectId
+        ? { businessId, $or: [{ id: transactionId }, { _id: transactionId }] }
+        : { businessId, id: transactionId };
 
-    if (transactions[index].clientName) {
-      recalculateClientLedger(transactions[index].clientName!);
-    }
+      const updatedDoc = await TransactionModel.findOneAndUpdate(
+        query,
+        { $set: updateData },
+        {
+          new: true,
+          runValidators: true,
+        }
+      ).lean();
 
-    await persistState();
-    res.json({ success: true, transaction: transactions[index] });
-  });
-
-  // API: Delete Transaction
-  app.delete('/api/transactions/:id', async (req, res) => {
-    const { id } = req.params;
-    const tx = transactions.find((t) => t.id === id);
-    if (!tx) {
-      return res.status(404).json({ error: 'Transaction not found' });
-    }
-
-    transactions = transactions.filter((t) => t.id !== id);
-    if (tx.clientName) {
-      recalculateClientLedger(tx.clientName);
-    }
-
-    await persistState();
-    res.json({ success: true, message: 'Transaction deleted' });
-  });
-
-  // API: Add or Update Client
-  app.post('/api/clients', async (req, res) => {
-    const { id, name, phone, email, company, serviceCategory, totalBilled, totalReceived, dueDate, notes } = req.body;
-
-    if (!name) {
-      return res.status(400).json({ error: 'Client name is required' });
-    }
-
-    const billed = Number(totalBilled) || 0;
-    const received = Number(totalReceived) || 0;
-    const outstanding = Math.max(0, billed - received);
-
-    if (id) {
-      const index = clients.findIndex((c) => c.id === id);
-      if (index !== -1) {
-        clients[index] = {
-          ...clients[index],
-          name,
-          phone,
-          email,
-          company,
-          serviceCategory,
-          totalBilled: billed,
-          totalReceived: received,
-          outstanding,
-          dueDate,
-          notes,
-          status: outstanding === 0 ? 'cleared' : (clients[index].status === 'overdue' ? 'overdue' : 'active'),
-        };
-        await persistState();
-        return res.json({ success: true, client: clients[index] });
+      if (!updatedDoc) {
+        return res.status(404).json({
+          error: 'Transaction not found',
+        });
       }
+
+      const updatedTransaction = stripMongoFields<Transaction>(updatedDoc);
+
+      if (updatedTransaction.clientName) {
+        await recalculateClientLedger(updatedTransaction.clientName, businessId);
+      }
+
+      console.log('[MongoDB] Transaction updated:', updatedTransaction);
+
+      return res.json({
+        success: true,
+        businessId,
+        transaction: updatedTransaction,
+      });
+
+    } catch (error) {
+      console.error('Update transaction error:', error);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to update transaction',
+      });
     }
-
-    const newClient: Client = {
-      id: 'client_' + Date.now(),
-      name,
-      phone,
-      email,
-      company,
-      serviceCategory: serviceCategory || 'General Consulting',
-      totalBilled: billed,
-      totalReceived: received,
-      outstanding,
-      dueDate: dueDate || new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
-      status: outstanding === 0 ? 'cleared' : 'active',
-      notes,
-      lastTransactionDate: new Date().toISOString().split('T')[0],
-    };
-
-    clients.push(newClient);
-    await persistState();
-    res.json({ success: true, client: newClient });
   });
 
-  // API: WhatsApp / Chat Message Handler (Gemini-Powered Natural Language Parsing & Q&A)
+  // API: Delete Transaction (Scoped by businessId)
+  app.delete('/api/transactions/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
+      const isObjectId = mongoose.Types.ObjectId.isValid(id);
+      const query: any = isObjectId
+        ? { businessId, $or: [{ id }, { _id: id }] }
+        : { businessId, id };
+
+      const txDoc = await TransactionModel.findOne(query).lean();
+      if (!txDoc) {
+        return res.status(404).json({ error: 'Transaction not found' });
+      }
+
+      await TransactionModel.deleteOne(query);
+
+      if (txDoc.clientName) {
+        await recalculateClientLedger(txDoc.clientName, businessId);
+      }
+
+      return res.json({ success: true, message: 'Transaction deleted' });
+    } catch (error) {
+      console.error('Delete transaction error:', error);
+      return res.status(500).json({ error: 'Failed to delete transaction' });
+    }
+  });
+
+  // API: Add or Update Client (Scoped by businessId)
+  app.post('/api/clients', async (req, res) => {
+    try {
+      const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
+      const { id, name, phone, email, company, serviceCategory, totalBilled, totalReceived, dueDate, notes } = req.body;
+
+      if (!name) {
+        return res.status(400).json({ error: 'Client name is required' });
+      }
+
+      const billed = Number(totalBilled) || 0;
+      const received = Number(totalReceived) || 0;
+      const outstanding = Math.max(0, billed - received);
+      const status = outstanding === 0 ? 'cleared' : 'active';
+
+      if (id) {
+        const updatedDoc = await ClientModel.findOneAndUpdate(
+          { businessId, id },
+          {
+            $set: {
+              name,
+              phone,
+              email,
+              company,
+              serviceCategory,
+              totalBilled: billed,
+              totalReceived: received,
+              outstanding,
+              dueDate,
+              notes,
+              status,
+            },
+          },
+          { new: true }
+        ).lean();
+
+        if (updatedDoc) {
+          return res.json({ success: true, businessId, client: stripMongoFields<Client>(updatedDoc) });
+        }
+      }
+
+      const newClientDoc = await ClientModel.create({
+        id: 'client_' + Date.now(),
+        businessId,
+        name,
+        phone,
+        email,
+        company,
+        serviceCategory: serviceCategory || 'General Consulting',
+        totalBilled: billed,
+        totalReceived: received,
+        outstanding,
+        dueDate: dueDate || new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
+        status,
+        notes,
+        lastTransactionDate: new Date().toISOString().split('T')[0],
+      });
+
+      return res.json({ success: true, businessId, client: stripMongoFields<Client>(newClientDoc) });
+    } catch (error) {
+      console.error('Save client error:', error);
+      return res.status(500).json({ error: 'Failed to save client' });
+    }
+  });
+
+  // API: WhatsApp / Chat Message Handler (Scoped by businessId)
   app.post('/api/chat/message', async (req, res) => {
-    const { text, sender = 'user' } = req.body;
+    const { text } = req.body;
+    const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
 
     if (!text || !text.trim()) {
       return res.status(400).json({ error: 'Message text cannot be empty' });
     }
 
-    const userMessage: ChatMessage = {
+    const appData = await loadApplicationData(businessId);
+    const { businessInfo, clients, transactions } = appData;
+
+    const userMessageDoc = await ChatMessageModel.create({
       id: 'msg_u_' + Date.now(),
+      businessId,
       sender: 'user',
       text: text.trim(),
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       status: 'read',
-    };
-
-    chatMessages.push(userMessage);
+    });
+    const userMessage = stripMongoFields<ChatMessage>(userMessageDoc);
 
     const gemini = getGeminiClient();
 
@@ -672,52 +891,47 @@ CURRENT FINANCIAL DATA CONTEXT:
 - Current Month Total Expenses: ₹${transactions.filter((t) => t.type === 'expense').reduce((s, t) => s + t.amount, 0)}
 
 INSTRUCTIONS:
-Determine whether the user is:
-1) RECORDING A TRANSACTION: e.g. "Received ₹5,000 from Rahul for website development", "Spent 1200 on packaging boxes", "Paid ₹850 for Uber ride", "Billed Vikram ₹20,000 for mobile app".
-2) ASKING A FINANCIAL QUERY: e.g. "How much did I earn this month?", "How much does Rahul owe me?", "What were my biggest expenses?", "Who owes me money?", "What is my net profit?".
-3) REQUESTING A REMINDER DRAFT: e.g. "Draft a reminder for Vikram", "Send payment reminder to Rahul".
-4) GENERAL/GREETING: Provide a friendly brief helpful WhatsApp guide.
+1. Determine intent: Is the user trying to LOG A TRANSACTION (e.g. "Received ₹5000 from Rahul", "Paid 450 for Uber") or ASK A FINANCIAL QUERY (e.g. "How much did I earn this month?", "Who owes me money?")?
+2. If LOGGING A TRANSACTION:
+   - Extract type ("income" or "expense" or "payment_received" or "bill_raised").
+   - Extract amount as a raw number.
+   - Extract client name or vendor name if mentioned.
+   - Map category to one of: "Web Development", "Design & Branding", "Consulting", "Product Sales", "Freelance Services", "Retainer", "Raw materials", "Marketing", "Transportation", "Utilities", "Packaging", "Equipment", "Software & Tools", "Rent & Workspace", "Other business expenses".
+   - Draft a polite WhatsApp reply confirming the details formatted cleanly with emojis and bold text.
+3. If ASKING A QUERY:
+   - Answer accurately based ONLY on the provided financial context data.
+   - Be helpful, encouraging, and concise.
 
-RESPONSE REQUIREMENTS:
 Return ONLY valid JSON matching this schema:
 {
-  "action": "add_transaction" | "query_answer" | "reminder_draft" | "general_reply",
-  "replyText": "WhatsApp formatted reply using *bold*, bullet points (•), short friendly tone, relevant emojis",
+  "action": "add_transaction" | "query_answer" | "unknown",
+  "intent": string,
+  "confidence": number,
   "transaction": {
-    "isTransaction": boolean,
-    "type": "income" | "expense" | "bill_raised" | "payment_received",
+    "type": "income" | "expense" | "payment_received" | "bill_raised",
     "amount": number,
     "clientName": string or null,
-    "category": string (e.g. "Raw materials", "Marketing", "Transportation", "Utilities", "Packaging", "Equipment", "Software & Tools", "Rent & Workspace", "Web Development", "Design & Branding", "Consulting", "Freelance Services", "Other business expenses"),
+    "category": string,
     "description": string,
-    "paymentMethod": "UPI" | "Bank Transfer" | "Cash" | "Card",
-    "notes": string
-  },
-  "clientUpdate": {
-    "clientName": string or null,
-    "billedAmount": number or 0,
-    "receivedAmount": number or 0
-  }
+    "paymentMethod": "UPI" | "Bank Transfer" | "Cash" | "Card"
+  } or null,
+  "replyText": "Formatted WhatsApp reply text"
 }`;
 
         const aiResponse = await gemini.models.generateContent({
           model: 'gemini-3.7-flash',
           contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-            temperature: 0.2,
-          },
+          config: { responseMimeType: 'application/json' },
         });
 
         const jsonStr = aiResponse.text?.trim() || '{}';
         const parsed = JSON.parse(jsonStr);
 
-        botResponseText = parsed.replyText || 'Message processed.';
+        botResponseText = parsed.replyText || 'I processed your message.';
         extractedDetails = {
           action: parsed.action,
-          amount: parsed.transaction?.amount,
-          clientName: parsed.transaction?.clientName,
-          category: parsed.transaction?.category,
+          intent: parsed.intent,
+          confidence: parsed.confidence,
           type: parsed.transaction?.type,
           summary: parsed.transaction?.description,
         };
@@ -727,8 +941,9 @@ Return ONLY valid JSON matching this schema:
             (c) => parsed.transaction.clientName && c.name.toLowerCase().includes(parsed.transaction.clientName.toLowerCase())
           );
 
-          createdTransaction = {
-            id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
+          const newTxObj: any = {
+            id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+            businessId,
             type: parsed.transaction.type || 'expense',
             amount: Number(parsed.transaction.amount),
             currency: '₹',
@@ -742,23 +957,15 @@ Return ONLY valid JSON matching this schema:
             createdAt: new Date().toISOString(),
           };
 
-          transactions.unshift(createdTransaction);
+          const txDoc = await TransactionModel.create(newTxObj);
+          createdTransaction = stripMongoFields<Transaction>(txDoc);
 
-          // Update client ledger if matched
           if (matchedClient) {
-            if (createdTransaction.type === 'income' || createdTransaction.type === 'payment_received') {
-              matchedClient.totalReceived += createdTransaction.amount;
-              matchedClient.outstanding = Math.max(0, matchedClient.totalBilled - matchedClient.totalReceived);
-              matchedClient.status = matchedClient.outstanding === 0 ? 'cleared' : matchedClient.status;
-            } else if (createdTransaction.type === 'bill_raised') {
-              matchedClient.totalBilled += createdTransaction.amount;
-              matchedClient.outstanding = matchedClient.totalBilled - matchedClient.totalReceived;
-            }
-            matchedClient.lastTransactionDate = createdTransaction.date;
+            await recalculateClientLedger(matchedClient.name, businessId);
           } else if (parsed.transaction.clientName && (createdTransaction.type === 'income' || createdTransaction.type === 'bill_raised')) {
-            // Auto-create new client if new client name introduced
-            const newClientObj: Client = {
+            await ClientModel.create({
               id: 'client_' + Date.now(),
+              businessId,
               name: parsed.transaction.clientName,
               serviceCategory: parsed.transaction.category || 'Freelance Services',
               totalBilled: createdTransaction.amount,
@@ -767,77 +974,78 @@ Return ONLY valid JSON matching this schema:
               status: createdTransaction.type === 'income' ? 'cleared' : 'active',
               dueDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
               lastTransactionDate: createdTransaction.date,
-            };
-            clients.push(newClientObj);
-            createdTransaction.clientId = newClientObj.id;
+            });
           }
         } else {
-          // If Gemini didn't classify as transaction, check if fallback parser identifies a transaction
-          const fallback = fallbackMessageParser(text);
+          const fallback = fallbackMessageParser(text, clients, transactions);
           if (fallback.action === 'add_transaction' && fallback.transaction && fallback.transaction.amount) {
             botResponseText = fallback.replyText;
             extractedDetails = { action: fallback.action };
-            createdTransaction = {
-              id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
+            const newTxObj: any = {
+              id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+              businessId,
               currency: '₹',
               date: new Date().toISOString().split('T')[0],
               source: 'whatsapp',
               createdAt: new Date().toISOString(),
               ...fallback.transaction,
-            } as Transaction;
-
-            transactions.unshift(createdTransaction);
+            };
+            const txDoc = await TransactionModel.create(newTxObj);
+            createdTransaction = stripMongoFields<Transaction>(txDoc);
             if (createdTransaction.clientName) {
-              recalculateClientLedger(createdTransaction.clientName);
+              await recalculateClientLedger(createdTransaction.clientName, businessId);
             }
           }
         }
       } catch (err) {
         console.error('Gemini Chat parsing error:', err);
-        // Fallback to local rule engine
-        const fallback = fallbackMessageParser(text);
+        const fallback = fallbackMessageParser(text, clients, transactions);
         botResponseText = fallback.replyText;
         extractedDetails = { action: fallback.action };
 
         if (fallback.action === 'add_transaction' && fallback.transaction && fallback.transaction.amount) {
-          createdTransaction = {
-            id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
+          const newTxObj: any = {
+            id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+            businessId,
             currency: '₹',
             date: new Date().toISOString().split('T')[0],
             source: 'whatsapp',
             createdAt: new Date().toISOString(),
             ...fallback.transaction,
-          } as Transaction;
-          transactions.unshift(createdTransaction);
+          };
+          const txDoc = await TransactionModel.create(newTxObj);
+          createdTransaction = stripMongoFields<Transaction>(txDoc);
           if (createdTransaction.clientName) {
-            recalculateClientLedger(createdTransaction.clientName);
+            await recalculateClientLedger(createdTransaction.clientName, businessId);
           }
         }
       }
     } else {
-      // Local fallback without Gemini API Key
-      const fallback = fallbackMessageParser(text);
+      const fallback = fallbackMessageParser(text, clients, transactions);
       botResponseText = fallback.replyText;
       extractedDetails = { action: fallback.action };
 
       if (fallback.action === 'add_transaction' && fallback.transaction && fallback.transaction.amount) {
-        createdTransaction = {
-          id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
+        const newTxObj: any = {
+          id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+          businessId,
           currency: '₹',
           date: new Date().toISOString().split('T')[0],
           source: 'whatsapp',
           createdAt: new Date().toISOString(),
           ...fallback.transaction,
-        } as Transaction;
-        transactions.unshift(createdTransaction);
+        };
+        const txDoc = await TransactionModel.create(newTxObj);
+        createdTransaction = stripMongoFields<Transaction>(txDoc);
         if (createdTransaction.clientName) {
-          recalculateClientLedger(createdTransaction.clientName);
+          await recalculateClientLedger(createdTransaction.clientName, businessId);
         }
       }
     }
 
-    const botMessage: ChatMessage = {
+    const botMessageDoc = await ChatMessageModel.create({
       id: 'msg_b_' + Date.now(),
+      businessId,
       sender: 'bot',
       text: botResponseText,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
@@ -845,38 +1053,27 @@ Return ONLY valid JSON matching this schema:
       type: createdTransaction ? 'transaction_confirmation' : 'text',
       transactionData: createdTransaction || undefined,
       extractedDetails,
-    };
-
-    chatMessages.push(botMessage);
-
-    // Save updated data to MongoDB
-    await persistApplicationData(
-      businessInfo,
-      clients,
-      transactions,
-      chatMessages
-    );
+    });
+    const botMessage = stripMongoFields<ChatMessage>(botMessageDoc);
 
     res.json({
       success: true,
       userMessage,
       botMessage,
       transaction: createdTransaction,
-      clients,
     });
   });
 
-  // API: Scan Receipt / UPI Payment Screenshot (Phase 2 - OCR & Gemini Vision)
+  // API: Scan Receipt (Scoped by businessId)
   app.post('/api/scan-receipt', async (req, res) => {
+    const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
     const { imageBase64, mimeType = 'image/jpeg', autoSave = false } = req.body;
 
     if (!imageBase64) {
       return res.status(400).json({ error: 'Image base64 data is required' });
     }
 
-    // Clean base64 string
     const cleanBase64 = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
-
     const gemini = getGeminiClient();
 
     let scanResult: ReceiptScanResult;
@@ -935,7 +1132,6 @@ Return ONLY valid JSON matching this schema:
         scanResult = JSON.parse(jsonStr);
       } catch (err) {
         console.error('Gemini receipt OCR error:', err);
-        // Realistic fallback scan
         scanResult = {
           amount: 1450,
           currency: '₹',
@@ -955,7 +1151,6 @@ Return ONLY valid JSON matching this schema:
         };
       }
     } else {
-      // Mock / fallback OCR
       scanResult = {
         amount: 2200,
         currency: '₹',
@@ -974,8 +1169,9 @@ Return ONLY valid JSON matching this schema:
     let savedTx: Transaction | null = null;
 
     if (autoSave && scanResult.amount) {
-      savedTx = {
+      const newTxObj: any = {
         id: 'tx_scan_' + Date.now(),
+        businessId,
         type: scanResult.type || 'expense',
         amount: scanResult.amount,
         currency: scanResult.currency || '₹',
@@ -989,11 +1185,13 @@ Return ONLY valid JSON matching this schema:
         notes: `Ref: ${scanResult.referenceNumber || 'N/A'}. Extracted via Gemini OCR.`,
         createdAt: new Date().toISOString(),
       };
-      transactions.unshift(savedTx);
 
-      // Add WhatsApp bot log
-      chatMessages.push({
+      const savedDoc = await TransactionModel.create(newTxObj);
+      savedTx = stripMongoFields<Transaction>(savedDoc);
+
+      await ChatMessageModel.create({
         id: 'msg_scan_' + Date.now(),
+        businessId,
         sender: 'bot',
         text: `📸 *Receipt Scanned & Recorded!*\n\n• *Amount:* ₹${savedTx.amount.toLocaleString('en-IN')}\n• *Party:* ${scanResult.merchantOrParty}\n• *Category:* ${savedTx.category}\n• *Payment:* ${savedTx.paymentMethod} (Ref: ${scanResult.referenceNumber || 'Verified'})\n• *Date:* ${savedTx.date}\n\n✅ *Record added to Expenses.*`,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
@@ -1003,13 +1201,6 @@ Return ONLY valid JSON matching this schema:
       });
     }
 
-    await persistApplicationData(
-      businessInfo,
-      clients,
-      transactions,
-      chatMessages
-    );
-
     res.json({
       success: true,
       result: scanResult,
@@ -1017,205 +1208,74 @@ Return ONLY valid JSON matching this schema:
     });
   });
 
-  // API: Payment Reminder Generator (Phase 2 - Intelligent Reminders)
+  // API: Generate WhatsApp Payment Reminder message
   app.post('/api/generate-reminder', async (req, res) => {
-    const { clientId, tone = 'polite' } = req.body;
-    const client = clients.find((c) => c.id === clientId);
+    const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
+    const { clientId, clientName } = req.body;
+    let client: Client | undefined = undefined;
+
+    if (clientId) {
+      const doc = await ClientModel.findOne({ businessId, id: clientId }).lean();
+      if (doc) client = stripMongoFields<Client>(doc);
+    }
+    if (!client && clientName) {
+      const doc = await ClientModel.findOne({ businessId, name: { $regex: new RegExp(`^${clientName.trim()}$`, 'i') } }).lean();
+      if (doc) client = stripMongoFields<Client>(doc);
+    }
 
     if (!client) {
       return res.status(404).json({ error: 'Client not found' });
     }
 
     const gemini = getGeminiClient();
-    let reminderText = '';
+    const businessDoc = await BusinessModel.findOne({ id: businessId }).lean();
+    const bInfo = businessDoc ? stripMongoFields<BusinessInfo>(businessDoc) : INITIAL_BUSINESS_INFO;
 
+    let reminderMessage = '';
     if (gemini) {
       try {
-        const prompt = `Write a personalized WhatsApp payment reminder message from "${businessInfo.name}" (${businessInfo.ownerName}) to client "${client.name}" (${client.company || 'Client'}).
-
-DETAILS:
-- Total Billed: ₹${client.totalBilled.toLocaleString('en-IN')}
-- Total Received: ₹${client.totalReceived.toLocaleString('en-IN')}
-- Outstanding Amount: ₹${client.outstanding.toLocaleString('en-IN')}
+        const prompt = `Draft a polite, professional, yet gentle WhatsApp payment reminder message from freelancer "${bInfo.ownerName}" (${bInfo.name}) to client "${client.name}".
+Context details:
+- Client Company: ${client.company || 'N/A'}
+- Service: ${client.serviceCategory || 'Freelance Work'}
+- Total Invoice Billed: ₹${client.totalBilled}
+- Total Paid So Far: ₹${client.totalReceived}
+- Remaining Balance Due: ₹${client.outstanding}
 - Due Date: ${client.dueDate || 'Immediate'}
-- Project / Service: ${client.serviceCategory || 'Freelance Services'}
-- UPI ID: ${businessInfo.upiId}
-- Tone required: "${tone}" (options: "polite", "friendly", "firm", "urgent")
+- Payment UPI ID: ${bInfo.upiId || 'studionova@upi'}
 
-REQUIREMENTS:
-- Make it suitable for WhatsApp with nice typography (bolding *key amounts*, clean bullet points, polite greeting).
-- Include payment options (UPI: ${businessInfo.upiId} or bank transfer).
-- Return ONLY the exact message text.`;
+Write a clear WhatsApp message with bullet points and friendly tone. Max 4 paragraphs. Do not add metadata wrappers.`;
 
-        const aiResponse = await gemini.models.generateContent({
+        const aiRes = await gemini.models.generateContent({
           model: 'gemini-3.7-flash',
           contents: prompt,
-          config: {
-            temperature: 0.4,
-          },
         });
-        reminderText = aiResponse.text?.trim() || '';
+
+        reminderMessage = aiRes.text?.trim() || '';
       } catch (err) {
         console.error('Gemini reminder generation error:', err);
       }
     }
 
-    if (!reminderText) {
-      // Template-based fallback
-      if (tone === 'firm' || tone === 'urgent') {
-        reminderText = `Hello *${client.name}*,\n\nThis is an urgent follow-up regarding the outstanding balance of *₹${client.outstanding.toLocaleString('en-IN')}* for *${client.serviceCategory}* which was due on *${client.dueDate || 'recently'}*.\n\nKindly clear the pending dues today via UPI to *${businessInfo.upiId}* or bank transfer.\n\nPlease share the transaction screenshot once completed. Thank you!\n\n— *${businessInfo.ownerName}* (${businessInfo.name})`;
-      } else {
-        reminderText = `Hi *${client.name}*! Hope you are having a great week 😊\n\nJust a gentle reminder regarding the milestone invoice for *${client.serviceCategory}*.\n\n• *Pending Amount:* *₹${client.outstanding.toLocaleString('en-IN')}*\n• *Due Date:* ${client.dueDate || 'This week'}\n• *UPI ID:* \`${businessInfo.upiId}\`\n\nPlease let me know once transferred or if you need an updated invoice copy. Thank you!\n\nBest,\n*${businessInfo.ownerName}* | ${businessInfo.name}`;
-      }
+    if (!reminderMessage) {
+      reminderMessage = `Hi ${client.name}! 👋\n\nHope you are having a productive week!\n\nThis is a quick friendly check-in regarding the pending balance for *${client.serviceCategory}*.\n\n📌 *Invoice Summary:*\n• Total Billed: ₹${client.totalBilled.toLocaleString('en-IN')}\n• Amount Received: ₹${client.totalReceived.toLocaleString('en-IN')}\n• *Pending Outstanding: ₹${client.outstanding.toLocaleString('en-IN')}*\n• *Due Date:* ${client.dueDate || 'Soon'}\n\nYou can transfer directly via UPI to *${bInfo.upiId}* or reply here once paid.\n\nThank you!\n_${bInfo.ownerName} (${bInfo.name})_`;
     }
+
+    const encodedText = encodeURIComponent(reminderMessage);
+    const cleanPhone = (client.phone || '').replace(/[^0-9]/g, '');
+    const whatsappWebUrl = `https://web.whatsapp.com/send?phone=${cleanPhone}&text=${encodedText}`;
+    const whatsappApiUrl = `https://api.whatsapp.com/send?phone=${cleanPhone}&text=${encodedText}`;
 
     res.json({
       success: true,
       client,
-      tone,
-      reminderText,
-      whatsappUrl: `https://wa.me/${client.phone?.replace(/[^0-9]/g, '') || ''}?text=${encodeURIComponent(reminderText)}`,
+      reminderMessage,
+      whatsappWebUrl,
+      whatsappApiUrl,
     });
   });
 
-  // API: WhatsApp Cloud API Webhook Handler (For live WhatsApp integration)
-  app.get('/api/whatsapp/webhook', (req, res) => {
-    // Webhook verification challenge
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
-
-    if (mode === 'subscribe' && token === (process.env.WHATSAPP_VERIFY_TOKEN || 'fintrack_verify_token')) {
-      console.log('WhatsApp Webhook Verified Successfully!');
-      return res.status(200).send(challenge);
-    } else {
-      return res.status(403).send('Forbidden verification token');
-    }
-  });
-
-  app.post('/api/whatsapp/webhook', async (req, res) => {
-    try {
-      const body = req.body;
-      let incomingText = '';
-      let senderNumber = '';
-      let phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID || '';
-
-      // 1. Meta WhatsApp Cloud API Format
-      if (body.object === 'whatsapp_business_account' && body.entry) {
-        for (const entry of body.entry) {
-          if (entry.changes) {
-            for (const change of entry.changes) {
-              const value = change.value;
-              if (value && value.messages && value.messages.length > 0) {
-                const message = value.messages[0];
-                senderNumber = message.from;
-                if (value.metadata && value.metadata.phone_number_id) {
-                  phoneNumberId = value.metadata.phone_number_id;
-                }
-
-                if (message.type === 'text' && message.text?.body) {
-                  incomingText = message.text.body;
-                }
-              }
-            }
-          }
-        }
-      }
-      // 2. Twilio WhatsApp webhook format (Body & From)
-      else if (req.body.Body && req.body.From) {
-        incomingText = req.body.Body;
-        senderNumber = req.body.From.replace('whatsapp:', '');
-      }
-
-      if (!incomingText) {
-        return res.status(200).json({ status: 'no_text_payload' });
-      }
-
-      console.log(`[WhatsApp Live Webhook] Received from ${senderNumber}: "${incomingText}"`);
-
-      // Process transaction via message handler logic
-      const userMessage: ChatMessage = {
-        id: 'msg_wa_' + Date.now(),
-        sender: 'user',
-        text: incomingText,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        status: 'read',
-      };
-      chatMessages.push(userMessage);
-
-      // Parse with fallback or Gemini
-      const parseResult = fallbackMessageParser(incomingText);
-      let replyText = parseResult.replyText;
-      let createdTx: Transaction | null = null;
-
-      if (parseResult.action === 'add_transaction' && parseResult.transaction && parseResult.transaction.amount) {
-        createdTx = {
-          id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
-          currency: '₹',
-          date: new Date().toISOString().split('T')[0],
-          source: 'whatsapp',
-          createdAt: new Date().toISOString(),
-          ...parseResult.transaction,
-        } as Transaction;
-
-        transactions.unshift(createdTx);
-        if (createdTx.clientName) {
-          recalculateClientLedger(createdTx.clientName);
-        }
-      }
-
-      const botMessage: ChatMessage = {
-        id: 'msg_wb_' + Date.now(),
-        sender: 'bot',
-        text: replyText,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        status: 'read',
-        type: createdTx ? 'transaction_confirmation' : 'text',
-        transactionData: createdTx || undefined,
-        extractedDetails: { action: parseResult.action },
-      };
-      chatMessages.push(botMessage);
-
-      // Save WhatsApp data to MongoDB
-      await persistApplicationData(
-        businessInfo,
-        clients,
-        transactions,
-        chatMessages
-      );
-
-
-      // If Meta WhatsApp Cloud API credentials are configured, send live reply back to user's WhatsApp
-      const accessToken = process.env.WHATSAPP_API_TOKEN;
-      if (accessToken && phoneNumberId && senderNumber) {
-        try {
-          await fetch(`https://graph.facebook.com/v20.0/${phoneNumberId}/messages`, {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${accessToken}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              messaging_product: 'whatsapp',
-              recipient_type: 'individual',
-              to: senderNumber,
-              type: 'text',
-              text: { body: replyText },
-            }),
-          });
-        } catch (waErr) {
-          console.error('Failed to send WhatsApp Cloud API reply:', waErr);
-        }
-      }
-
-      return res.status(200).json({ status: 'success', messageLogged: true, transaction: createdTx });
-    } catch (e) {
-      console.error('Webhook processing error:', e);
-      return res.status(500).json({ error: 'Webhook processing error' });
-    }
-  });
-
-  // Vite middleware for development vs Static serving for production
+  // Serve Vite frontend during local development or static dist in production
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1223,10 +1283,10 @@ REQUIREMENTS:
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+      res.sendFile(path.resolve(distPath, 'index.html'));
     });
   }
 
@@ -1235,4 +1295,4 @@ REQUIREMENTS:
   });
 }
 
-startServer();
+startServer().catch(console.error);

@@ -1,6 +1,6 @@
 export type TransactionType = 'income' | 'expense' | 'bill_raised' | 'payment_received';
 
-export type ExpenseCategory = 
+export type ExpenseCategory =
   | 'Raw materials'
   | 'Marketing'
   | 'Transportation'
@@ -11,7 +11,7 @@ export type ExpenseCategory =
   | 'Rent & Workspace'
   | 'Other business expenses';
 
-export type IncomeCategory = 
+export type IncomeCategory =
   | 'Web Development'
   | 'Design & Branding'
   | 'Consulting'
@@ -30,20 +30,30 @@ export interface BusinessInfo {
 
 export interface Transaction {
   id: string;
+  businessId?: string;
+
   type: TransactionType;
   amount: number;
-  currency: string; // default '₹'
+  currency: string;
+
   clientId?: string;
   clientName?: string;
+
   category: ExpenseCategory | IncomeCategory | string;
   description: string;
-  date: string; // ISO string or YYYY-MM-DD
+  date: string;
+
   paymentMethod?: 'UPI' | 'Bank Transfer' | 'Cash' | 'Card' | 'Cheque';
+
   receiptUrl?: string;
   receiptImageBase64?: string;
+
   notes?: string;
+
   whatsappMessageId?: string;
+
   source: 'whatsapp' | 'web' | 'receipt_scan';
+
   createdAt: string;
 }
 
@@ -73,6 +83,8 @@ export interface ChatMessage {
   transactionData?: Partial<Transaction>;
   extractedDetails?: {
     action: 'add_transaction' | 'query_answer' | 'reminder' | 'unknown';
+    intent?: string;
+    confidence?: number;
     amount?: number;
     clientName?: string;
     category?: string;
