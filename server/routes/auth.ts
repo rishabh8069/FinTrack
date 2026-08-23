@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { UserModel } from '../models/User';
 import { BusinessModel } from '../models/Business';
 import { generateToken, verifyToken } from '../utils/jwt';
+import { authMiddleware, AuthRequest } from '../middleware/auth';
 
 const router = Router();
 
@@ -238,6 +239,15 @@ router.post('/onboarding', async (req, res) => {
             message: 'User onboarding failed',
         });
     }
+});
+
+// TEST PROTECTED AUTH ROUTE
+router.get('/auth-test', authMiddleware, (req: AuthRequest, res) => {
+    return res.json({
+        success: true,
+        message: 'Authentication middleware is working',
+        user: req.user,
+    });
 });
 
 export default router;

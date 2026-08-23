@@ -13,11 +13,14 @@ import { connectDatabase, loadApplicationData, seedDatabase, stripMongoFields } 
 import { DEMO_BUSINESS_ID } from './server/constants.ts';
 import { Transaction, Client, ChatMessage, ReceiptScanResult, IncomeCategory, ExpenseCategory, BusinessInfo } from './src/types.ts';
 import { UserModel } from './server/models/User';
-import { BusinessModel } from './server/models/Business';
+import { BusinessModel, IBusiness } from './server/models/Business';
 import { ClientModel } from './server/models/Client';
 import { TransactionModel } from './server/models/Transaction';
 import { ChatMessageModel } from './server/models/ChatMessage';
 import authRouter from './server/routes/auth';
+import { authMiddleware, AuthRequest } from './server/middleware/auth';
+import { businessMiddleware, BusinessRequest } from './server/middleware/business';
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -487,107 +490,119 @@ async function startServer() {
   });
 
   // API: Get Business Profile by ID
-  app.get('/api/business/:id', async (req, res) => {
-    try {
-      const { id } = req.params;
-      const businessDoc = await BusinessModel.findOne({ id }).lean();
-      if (!businessDoc) {
-        return res.status(404).json({ error: 'Business profile not found' });
-      }
-      return res.json({
-        success: true,
-        businessId: id,
-        businessInfo: {
-          id,
-          ...stripMongoFields<BusinessInfo>(businessDoc),
-        },
-      });
-    } catch (error) {
-      console.error('[Business] Failed to fetch business profile:', error);
-      return res.status(500).json({ error: 'Failed to fetch business profile' });
-    }
-  });
+  app.get(
+    '/api/business',
+    authMiddleware,
+    businessMiddleware,
+    async (req: BusinessRequest, res) => {
+      try {
+        const businessId = req.businessId;
 
-  // API: Update Business Profile by ID
-  app.put('/api/business/:id', async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { name, ownerName, currency, phone, upiId } = req.body;
+        if (!businessId) {
+          return res.status(403).json({
+            success: false,
+            message: 'Business not found for authenticated user',
+          });
+        }
 
-      const updatedBusiness = await BusinessModel.findOneAndUpdate(
-        { id },
-        {
-          $set: {
-            ...(name && { name: name.trim() }),
-            ...(ownerName && { ownerName: ownerName.trim() }),
-            ...(currency && { currency }),
-            ...(phone !== undefined && { phone }),
-            ...(upiId !== undefined && { upiId }),
-          },
-        },
-        { new: true }
-      ).lean();
+        const business = await BusinessModel
+          .findOne({ id: businessId })
+          .lean();
 
-      if (!updatedBusiness) {
-        return res.status(404).json({ error: 'Business profile not found' });
-      }
+        if (!business) {
+          return res.status(404).json({
+            success: false,
+            message: 'Business not found',
+          });
+        }
 
-      return res.json({
-        success: true,
-        businessId: id,
-        businessInfo: {
-          id,
-          ...stripMongoFields<BusinessInfo>(updatedBusiness),
-        },
-      });
-    } catch (error) {
-      console.error('[Business] Failed to update business profile:', error);
-      return res.status(500).json({ error: 'Failed to update business profile' });
-    }
-  });
+        return res.json({
+          success: true,
+          business: stripMongoFields<IBusiness>(business),
+        });
 
-  // API: Update Active/Current Business Profile
-  app.put('/api/business', async (req, res) => {
-    try {
-      const { id, name, ownerName, currency, phone, upiId } = req.body;
-      const targetBusinessId = id || getBusinessId(req) || DEMO_BUSINESS_ID;
+      } catch (error) {
+        console.error('Get business error:', error);
 
-      if (!name || !ownerName) {
-        return res.status(400).json({
-          error: 'Business name and owner name are required',
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to fetch business',
         });
       }
-
-      const updatedBusiness = await BusinessModel.findOneAndUpdate(
-        { id: targetBusinessId },
-        {
-          $set: {
-            id: targetBusinessId,
-            name,
-            ownerName,
-            currency: currency || '₹',
-            phone: phone || '',
-            upiId: upiId || '',
-          },
-        },
-        { new: true, upsert: true }
-      ).lean();
-
-      return res.json({
-        success: true,
-        businessId: targetBusinessId,
-        businessInfo: {
-          id: targetBusinessId,
-          ...stripMongoFields<BusinessInfo>(updatedBusiness),
-        },
-      });
-    } catch (error) {
-      console.error('[Business] Failed to save business profile:', error);
-      return res.status(500).json({
-        error: 'Failed to save business profile',
-      });
     }
-  });
+  );
+
+  // API: Update Current Business Profile
+  app.put(
+    '/api/business',
+    authMiddleware,
+    businessMiddleware,
+    async (req: BusinessRequest, res) => {
+      try {
+        const businessId = req.businessId;
+
+        if (!businessId) {
+          return res.status(403).json({
+            success: false,
+            message: 'Business not associated with authenticated user',
+          });
+        }
+
+        const {
+          name,
+          ownerName,
+          currency,
+          phone,
+          upiId,
+        } = req.body;
+
+        if (!name || !ownerName) {
+          return res.status(400).json({
+            success: false,
+            message: 'Business name and owner name are required',
+          });
+        }
+
+        const updatedBusiness = await BusinessModel.findOneAndUpdate(
+          { id: businessId },
+          {
+            $set: {
+              name: name.trim(),
+              ownerName: ownerName.trim(),
+              currency: currency || '₹',
+              phone: phone || '',
+              upiId: upiId || '',
+            },
+          },
+          {
+            new: true,
+            runValidators: true,
+          }
+        ).lean();
+
+        if (!updatedBusiness) {
+          return res.status(404).json({
+            success: false,
+            message: 'Business profile not found',
+          });
+        }
+
+        return res.json({
+          success: true,
+          businessId,
+          businessInfo: stripMongoFields<IBusiness>(updatedBusiness),
+        });
+
+      } catch (error) {
+        console.error('[Business] Failed to update business:', error);
+
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to update business profile',
+        });
+      }
+    }
+  );
 
   // API: Reset / Seed Data
   app.post('/api/reset', async (req, res) => {
@@ -596,290 +611,355 @@ async function startServer() {
   });
 
   // API: Get Transactions (Scoped by businessId)
-  app.get('/api/transactions', async (req, res) => {
-    try {
-      const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
-      const dbTransactions = await TransactionModel
-        .find({ businessId })
-        .sort({ createdAt: -1 })
-        .lean();
+  app.get(
+    '/api/transactions',
+    authMiddleware,
+    businessMiddleware,
+    async (req: BusinessRequest, res) => {
+      try {
+        const businessId = req.businessId!;
+        const dbTransactions = await TransactionModel
+          .find({ businessId })
+          .sort({ createdAt: -1 })
+          .lean();
 
-      const transactions = dbTransactions.map((doc) => stripMongoFields<Transaction>(doc));
+        const transactions = dbTransactions.map((doc) => stripMongoFields<Transaction>(doc));
 
-      return res.json({
-        success: true,
-        businessId,
-        transactions,
-      });
-    } catch (error) {
-      console.error('Get transactions error:', error);
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to fetch transactions',
-      });
-    }
-  });
+        return res.json({
+          success: true,
+          businessId,
+          transactions,
+        });
+      } catch (error) {
+        console.error('Get transactions error:', error);
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to fetch transactions',
+        });
+      }
+    });
 
   // API: Get Single Transaction by ID (Scoped by businessId)
-  app.get('/api/transactions/:id', async (req, res) => {
-    try {
-      const transactionId = req.params.id;
-      const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
-      const isObjectId = mongoose.Types.ObjectId.isValid(transactionId);
-      const query: any = isObjectId
-        ? { businessId, $or: [{ id: transactionId }, { _id: transactionId }] }
-        : { businessId, id: transactionId };
+  app.get(
+    '/api/transactions/:id',
+    authMiddleware,
+    businessMiddleware,
+    async (req: BusinessRequest, res) => {
+      try {
+        const transactionId = req.params.id;
+        const businessId = req.businessId!;
+        const isObjectId = mongoose.Types.ObjectId.isValid(transactionId);
+        const query: any = isObjectId
+          ? { businessId, $or: [{ id: transactionId }, { _id: transactionId }] }
+          : { businessId, id: transactionId };
 
-      const txDoc = await TransactionModel.findOne(query).lean();
-      if (!txDoc) {
-        return res.status(404).json({ error: 'Transaction not found' });
+        const txDoc = await TransactionModel.findOne(query).lean();
+        if (!txDoc) {
+          return res.status(404).json({ error: 'Transaction not found' });
+        }
+
+        return res.json(stripMongoFields<Transaction>(txDoc));
+      } catch (error) {
+        console.error('Get transaction error:', error);
+        return res.status(500).json({ error: 'Failed to fetch transaction' });
       }
-
-      return res.json(stripMongoFields<Transaction>(txDoc));
-    } catch (error) {
-      console.error('Get transaction error:', error);
-      return res.status(500).json({ error: 'Failed to fetch transaction' });
-    }
-  });
+    });
 
   // API: Create Manual Transaction (Scoped by businessId)
-  app.post('/api/transactions', async (req, res) => {
-    try {
-      const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
-      const {
-        type,
-        amount,
-        currency = '₹',
-        clientName,
-        clientId,
-        category,
-        description,
-        date,
-        paymentMethod = 'UPI',
-        notes,
-      } = req.body;
+  app.post(
+    '/api/transactions',
+    authMiddleware,
+    businessMiddleware,
+    async (req: BusinessRequest, res) => {
+      try {
+        const businessId = req.businessId!;
+        const {
+          type,
+          amount,
+          currency = '₹',
+          clientName,
+          clientId,
+          category,
+          description,
+          date,
+          paymentMethod = 'UPI',
+          notes,
+        } = req.body;
 
-      if (!amount || isNaN(Number(amount))) {
-        return res.status(400).json({
+        if (!amount || isNaN(Number(amount))) {
+          return res.status(400).json({
+            success: false,
+            error: 'Valid amount is required',
+          });
+        }
+
+        const newTx: any = {
+          id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+          businessId,
+          type: type || 'expense',
+          amount: Number(amount),
+          currency,
+          clientName: clientName || undefined,
+          clientId: clientId || undefined,
+          category: category || (type === 'income' ? 'Freelance Services' : 'Other business expenses'),
+          description: description || `${type === 'income' ? 'Income' : 'Expense'} entry`,
+          date: date || new Date().toISOString().split('T')[0],
+          paymentMethod,
+          notes,
+          source: 'web',
+          createdAt: new Date().toISOString(),
+        };
+
+        const savedDoc = await TransactionModel.create(newTx);
+        const savedTransaction = stripMongoFields<Transaction>(savedDoc);
+
+        if (clientName) {
+          await recalculateClientLedger(clientName, businessId);
+        }
+
+        return res.status(201).json({
+          success: true,
+          businessId,
+          transaction: savedTransaction,
+        });
+      } catch (error) {
+        console.error('Create transaction error:', error);
+        return res.status(500).json({
           success: false,
-          error: 'Valid amount is required',
+          message: 'Failed to create transaction',
         });
       }
-
-      const newTx: any = {
-        id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
-        businessId,
-        type: type || 'expense',
-        amount: Number(amount),
-        currency,
-        clientName: clientName || undefined,
-        clientId: clientId || undefined,
-        category: category || (type === 'income' ? 'Freelance Services' : 'Other business expenses'),
-        description: description || `${type === 'income' ? 'Income' : 'Expense'} entry`,
-        date: date || new Date().toISOString().split('T')[0],
-        paymentMethod,
-        notes,
-        source: 'web',
-        createdAt: new Date().toISOString(),
-      };
-
-      const savedDoc = await TransactionModel.create(newTx);
-      const savedTransaction = stripMongoFields<Transaction>(savedDoc);
-
-      if (clientName) {
-        await recalculateClientLedger(clientName, businessId);
-      }
-
-      return res.status(201).json({
-        success: true,
-        businessId,
-        transaction: savedTransaction,
-      });
-    } catch (error) {
-      console.error('Create transaction error:', error);
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to create transaction',
-      });
-    }
-  });
+    });
 
   // API: Update Transaction (Scoped by businessId)
-  app.put('/api/transactions/:id', async (req, res) => {
-    try {
-      const transactionId = req.params.id;
-      const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
-      const updateData = { ...req.body };
-      delete updateData.id;
-      delete updateData._id;
+  app.put(
+    '/api/transactions/:id',
+    authMiddleware,
+    businessMiddleware,
+    async (req: BusinessRequest, res) => {
+      try {
+        const transactionId = req.params.id;
+        const businessId = req.businessId!;
+        const updateData = { ...req.body };
+        delete updateData.id;
+        delete updateData._id;
 
-      const isObjectId = mongoose.Types.ObjectId.isValid(transactionId);
-      const query: any = isObjectId
-        ? { businessId, $or: [{ id: transactionId }, { _id: transactionId }] }
-        : { businessId, id: transactionId };
+        const isObjectId = mongoose.Types.ObjectId.isValid(transactionId);
+        const query: any = isObjectId
+          ? { businessId, $or: [{ id: transactionId }, { _id: transactionId }] }
+          : { businessId, id: transactionId };
 
-      const updatedDoc = await TransactionModel.findOneAndUpdate(
-        query,
-        { $set: updateData },
-        {
-          new: true,
-          runValidators: true,
-        }
-      ).lean();
-
-      if (!updatedDoc) {
-        return res.status(404).json({
-          error: 'Transaction not found',
-        });
-      }
-
-      const updatedTransaction = stripMongoFields<Transaction>(updatedDoc);
-
-      if (updatedTransaction.clientName) {
-        await recalculateClientLedger(updatedTransaction.clientName, businessId);
-      }
-
-      console.log('[MongoDB] Transaction updated:', updatedTransaction);
-
-      return res.json({
-        success: true,
-        businessId,
-        transaction: updatedTransaction,
-      });
-
-    } catch (error) {
-      console.error('Update transaction error:', error);
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to update transaction',
-      });
-    }
-  });
-
-  // API: Delete Transaction (Scoped by businessId)
-  app.delete('/api/transactions/:id', async (req, res) => {
-    try {
-      const { id } = req.params;
-      const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
-      const isObjectId = mongoose.Types.ObjectId.isValid(id);
-      const query: any = isObjectId
-        ? { businessId, $or: [{ id }, { _id: id }] }
-        : { businessId, id };
-
-      const txDoc = await TransactionModel.findOne(query).lean();
-      if (!txDoc) {
-        return res.status(404).json({ error: 'Transaction not found' });
-      }
-
-      await TransactionModel.deleteOne(query);
-
-      if (txDoc.clientName) {
-        await recalculateClientLedger(txDoc.clientName, businessId);
-      }
-
-      return res.json({ success: true, message: 'Transaction deleted' });
-    } catch (error) {
-      console.error('Delete transaction error:', error);
-      return res.status(500).json({ error: 'Failed to delete transaction' });
-    }
-  });
-
-  // API: Add or Update Client (Scoped by businessId)
-  app.post('/api/clients', async (req, res) => {
-    try {
-      const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
-      const { id, name, phone, email, company, serviceCategory, totalBilled, totalReceived, dueDate, notes } = req.body;
-
-      if (!name) {
-        return res.status(400).json({ error: 'Client name is required' });
-      }
-
-      const billed = Number(totalBilled) || 0;
-      const received = Number(totalReceived) || 0;
-      const outstanding = Math.max(0, billed - received);
-      const status = outstanding === 0 ? 'cleared' : 'active';
-
-      if (id) {
-        const updatedDoc = await ClientModel.findOneAndUpdate(
-          { businessId, id },
+        const updatedDoc = await TransactionModel.findOneAndUpdate(
+          query,
+          { $set: updateData },
           {
-            $set: {
-              name,
-              phone,
-              email,
-              company,
-              serviceCategory,
-              totalBilled: billed,
-              totalReceived: received,
-              outstanding,
-              dueDate,
-              notes,
-              status,
-            },
-          },
-          { new: true }
+            new: true,
+            runValidators: true,
+          }
         ).lean();
 
-        if (updatedDoc) {
-          return res.json({ success: true, businessId, client: stripMongoFields<Client>(updatedDoc) });
+        if (!updatedDoc) {
+          return res.status(404).json({
+            error: 'Transaction not found',
+          });
         }
+
+        const updatedTransaction = stripMongoFields<Transaction>(updatedDoc);
+
+        if (updatedTransaction.clientName) {
+          await recalculateClientLedger(updatedTransaction.clientName, businessId);
+        }
+
+        console.log('[MongoDB] Transaction updated:', updatedTransaction);
+
+        return res.json({
+          success: true,
+          businessId,
+          transaction: updatedTransaction,
+        });
+
+      } catch (error) {
+        console.error('Update transaction error:', error);
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to update transaction',
+        });
       }
+    });
 
-      const newClientDoc = await ClientModel.create({
-        id: 'client_' + Date.now(),
-        businessId,
-        name,
-        phone,
-        email,
-        company,
-        serviceCategory: serviceCategory || 'General Consulting',
-        totalBilled: billed,
-        totalReceived: received,
-        outstanding,
-        dueDate: dueDate || new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
-        status,
-        notes,
-        lastTransactionDate: new Date().toISOString().split('T')[0],
-      });
+  // API: Delete Transaction (Scoped by businessId)
+  app.delete(
+    '/api/transactions/:id',
+    authMiddleware,
+    businessMiddleware,
+    async (req: BusinessRequest, res) => {
+      try {
+        const { id } = req.params;
+        const businessId = req.businessId!;
+        const isObjectId = mongoose.Types.ObjectId.isValid(id);
+        const query: any = isObjectId
+          ? { businessId, $or: [{ id }, { _id: id }] }
+          : { businessId, id };
 
-      return res.json({ success: true, businessId, client: stripMongoFields<Client>(newClientDoc) });
-    } catch (error) {
-      console.error('Save client error:', error);
-      return res.status(500).json({ error: 'Failed to save client' });
-    }
-  });
+        const txDoc = await TransactionModel.findOne(query).lean();
+        if (!txDoc) {
+          return res.status(404).json({ error: 'Transaction not found' });
+        }
+
+        await TransactionModel.deleteOne(query);
+
+        if (txDoc.clientName) {
+          await recalculateClientLedger(txDoc.clientName, businessId);
+        }
+
+        return res.json({ success: true, message: 'Transaction deleted' });
+      } catch (error) {
+        console.error('Delete transaction error:', error);
+        return res.status(500).json({ error: 'Failed to delete transaction' });
+      }
+    });
+
+  // API: Add or Update Client (Scoped by businessId)
+  app.post(
+    '/api/clients',
+    authMiddleware,
+    businessMiddleware,
+    async (req: BusinessRequest, res) => {
+      try {
+        const businessId = req.businessId!;
+        const { id, name, phone, email, company, serviceCategory, totalBilled, totalReceived, dueDate, notes } = req.body;
+
+        if (!name) {
+          return res.status(400).json({ error: 'Client name is required' });
+        }
+
+        const billed = Number(totalBilled) || 0;
+        const received = Number(totalReceived) || 0;
+        const outstanding = Math.max(0, billed - received);
+        const status = outstanding === 0 ? 'cleared' : 'active';
+
+        if (id) {
+          const updatedDoc = await ClientModel.findOneAndUpdate(
+            { businessId, id },
+            {
+              $set: {
+                name,
+                phone,
+                email,
+                company,
+                serviceCategory,
+                totalBilled: billed,
+                totalReceived: received,
+                outstanding,
+                dueDate,
+                notes,
+                status,
+              },
+            },
+            { new: true }
+          ).lean();
+
+          if (updatedDoc) {
+            return res.json({ success: true, businessId, client: stripMongoFields<Client>(updatedDoc) });
+          }
+        }
+
+        const newClientDoc = await ClientModel.create({
+          id: 'client_' + Date.now(),
+          businessId,
+          name,
+          phone,
+          email,
+          company,
+          serviceCategory: serviceCategory || 'General Consulting',
+          totalBilled: billed,
+          totalReceived: received,
+          outstanding,
+          dueDate: dueDate || new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
+          status,
+          notes,
+          lastTransactionDate: new Date().toISOString().split('T')[0],
+        });
+
+        return res.json({ success: true, businessId, client: stripMongoFields<Client>(newClientDoc) });
+      } catch (error) {
+        console.error('Save client error:', error);
+        return res.status(500).json({ error: 'Failed to save client' });
+      }
+    });
+
+  // API: Get Single Client by ID (Scoped by businessId)
+  app.get('/api/clients/:id',
+    authMiddleware,
+    businessMiddleware,
+    async (req: BusinessRequest, res) => {
+      try {
+        const { id } = req.params;
+
+        const businessId = req.businessId!;
+
+        const client = await ClientModel
+          .findOne({ businessId, id })
+          .lean();
+
+        if (!client) {
+          return res.status(404).json({
+            success: false,
+            message: 'Client not found',
+          });
+        }
+
+        return res.json({
+          success: true,
+          businessId,
+          client: stripMongoFields<Client>(client),
+        });
+
+      } catch (error) {
+        console.error('Get client error:', error);
+
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to fetch client',
+        });
+      }
+    });
 
   // API: WhatsApp / Chat Message Handler (Scoped by businessId)
-  app.post('/api/chat/message', async (req, res) => {
-    const { text } = req.body;
-    const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
+  app.post(
+    '/api/chat/message',
+    authMiddleware,
+    businessMiddleware,
+    async (req: BusinessRequest, res) => {
+      const { text } = req.body;
+      const businessId = req.businessId!;
 
-    if (!text || !text.trim()) {
-      return res.status(400).json({ error: 'Message text cannot be empty' });
-    }
+      if (!text || !text.trim()) {
+        return res.status(400).json({ error: 'Message text cannot be empty' });
+      }
 
-    const appData = await loadApplicationData(businessId);
-    const { businessInfo, clients, transactions } = appData;
+      const appData = await loadApplicationData(businessId);
+      const { businessInfo, clients, transactions } = appData;
 
-    const userMessageDoc = await ChatMessageModel.create({
-      id: 'msg_u_' + Date.now(),
-      businessId,
-      sender: 'user',
-      text: text.trim(),
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      status: 'read',
-    });
-    const userMessage = stripMongoFields<ChatMessage>(userMessageDoc);
+      const userMessageDoc = await ChatMessageModel.create({
+        id: 'msg_u_' + Date.now(),
+        businessId,
+        sender: 'user',
+        text: text.trim(),
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        status: 'read',
+      });
+      const userMessage = stripMongoFields<ChatMessage>(userMessageDoc);
 
-    const gemini = getGeminiClient();
+      const gemini = getGeminiClient();
 
-    let botResponseText = '';
-    let extractedDetails: ChatMessage['extractedDetails'] = undefined;
-    let createdTransaction: Transaction | null = null;
+      let botResponseText = '';
+      let extractedDetails: ChatMessage['extractedDetails'] = undefined;
+      let createdTransaction: Transaction | null = null;
 
-    if (gemini) {
-      try {
-        const prompt = `You are FinTrack Assistant, an intelligent WhatsApp bot for freelancers and home-business owners.
+      if (gemini) {
+        try {
+          const prompt = `You are FinTrack Assistant, an intelligent WhatsApp bot for freelancers and home-business owners.
 The user sent the following WhatsApp message: "${text.trim()}".
 
 CURRENT FINANCIAL DATA CONTEXT:
@@ -918,69 +998,92 @@ Return ONLY valid JSON matching this schema:
   "replyText": "Formatted WhatsApp reply text"
 }`;
 
-        const aiResponse = await gemini.models.generateContent({
-          model: 'gemini-3.7-flash',
-          contents: prompt,
-          config: { responseMimeType: 'application/json' },
-        });
+          const aiResponse = await gemini.models.generateContent({
+            model: 'gemini-3.7-flash',
+            contents: prompt,
+            config: { responseMimeType: 'application/json' },
+          });
 
-        const jsonStr = aiResponse.text?.trim() || '{}';
-        const parsed = JSON.parse(jsonStr);
+          const jsonStr = aiResponse.text?.trim() || '{}';
+          const parsed = JSON.parse(jsonStr);
 
-        botResponseText = parsed.replyText || 'I processed your message.';
-        extractedDetails = {
-          action: parsed.action,
-          intent: parsed.intent,
-          confidence: parsed.confidence,
-          type: parsed.transaction?.type,
-          summary: parsed.transaction?.description,
-        };
-
-        if (parsed.action === 'add_transaction' && parsed.transaction?.amount) {
-          const matchedClient = clients.find(
-            (c) => parsed.transaction.clientName && c.name.toLowerCase().includes(parsed.transaction.clientName.toLowerCase())
-          );
-
-          const newTxObj: any = {
-            id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
-            businessId,
-            type: parsed.transaction.type || 'expense',
-            amount: Number(parsed.transaction.amount),
-            currency: '₹',
-            clientName: matchedClient ? matchedClient.name : (parsed.transaction.clientName || undefined),
-            clientId: matchedClient ? matchedClient.id : undefined,
-            category: parsed.transaction.category || (parsed.transaction.type === 'income' ? 'Freelance Services' : 'Other business expenses'),
-            description: parsed.transaction.description || text,
-            date: new Date().toISOString().split('T')[0],
-            paymentMethod: parsed.transaction.paymentMethod || 'UPI',
-            source: 'whatsapp',
-            createdAt: new Date().toISOString(),
+          botResponseText = parsed.replyText || 'I processed your message.';
+          extractedDetails = {
+            action: parsed.action,
+            intent: parsed.intent,
+            confidence: parsed.confidence,
+            type: parsed.transaction?.type,
+            summary: parsed.transaction?.description,
           };
 
-          const txDoc = await TransactionModel.create(newTxObj);
-          createdTransaction = stripMongoFields<Transaction>(txDoc);
+          if (parsed.action === 'add_transaction' && parsed.transaction?.amount) {
+            const matchedClient = clients.find(
+              (c) => parsed.transaction.clientName && c.name.toLowerCase().includes(parsed.transaction.clientName.toLowerCase())
+            );
 
-          if (matchedClient) {
-            await recalculateClientLedger(matchedClient.name, businessId);
-          } else if (parsed.transaction.clientName && (createdTransaction.type === 'income' || createdTransaction.type === 'bill_raised')) {
-            await ClientModel.create({
-              id: 'client_' + Date.now(),
+            const newTxObj: any = {
+              id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
               businessId,
-              name: parsed.transaction.clientName,
-              serviceCategory: parsed.transaction.category || 'Freelance Services',
-              totalBilled: createdTransaction.amount,
-              totalReceived: createdTransaction.type === 'income' ? createdTransaction.amount : 0,
-              outstanding: createdTransaction.type === 'income' ? 0 : createdTransaction.amount,
-              status: createdTransaction.type === 'income' ? 'cleared' : 'active',
-              dueDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
-              lastTransactionDate: createdTransaction.date,
-            });
+              type: parsed.transaction.type || 'expense',
+              amount: Number(parsed.transaction.amount),
+              currency: '₹',
+              clientName: matchedClient ? matchedClient.name : (parsed.transaction.clientName || undefined),
+              clientId: matchedClient ? matchedClient.id : undefined,
+              category: parsed.transaction.category || (parsed.transaction.type === 'income' ? 'Freelance Services' : 'Other business expenses'),
+              description: parsed.transaction.description || text,
+              date: new Date().toISOString().split('T')[0],
+              paymentMethod: parsed.transaction.paymentMethod || 'UPI',
+              source: 'whatsapp',
+              createdAt: new Date().toISOString(),
+            };
+
+            const txDoc = await TransactionModel.create(newTxObj);
+            createdTransaction = stripMongoFields<Transaction>(txDoc);
+
+            if (matchedClient) {
+              await recalculateClientLedger(matchedClient.name, businessId);
+            } else if (parsed.transaction.clientName && (createdTransaction.type === 'income' || createdTransaction.type === 'bill_raised')) {
+              await ClientModel.create({
+                id: 'client_' + Date.now(),
+                businessId,
+                name: parsed.transaction.clientName,
+                serviceCategory: parsed.transaction.category || 'Freelance Services',
+                totalBilled: createdTransaction.amount,
+                totalReceived: createdTransaction.type === 'income' ? createdTransaction.amount : 0,
+                outstanding: createdTransaction.type === 'income' ? 0 : createdTransaction.amount,
+                status: createdTransaction.type === 'income' ? 'cleared' : 'active',
+                dueDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
+                lastTransactionDate: createdTransaction.date,
+              });
+            }
+          } else {
+            const fallback = fallbackMessageParser(text, clients, transactions);
+            if (fallback.action === 'add_transaction' && fallback.transaction && fallback.transaction.amount) {
+              botResponseText = fallback.replyText;
+              extractedDetails = { action: fallback.action };
+              const newTxObj: any = {
+                id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+                businessId,
+                currency: '₹',
+                date: new Date().toISOString().split('T')[0],
+                source: 'whatsapp',
+                createdAt: new Date().toISOString(),
+                ...fallback.transaction,
+              };
+              const txDoc = await TransactionModel.create(newTxObj);
+              createdTransaction = stripMongoFields<Transaction>(txDoc);
+              if (createdTransaction.clientName) {
+                await recalculateClientLedger(createdTransaction.clientName, businessId);
+              }
+            }
           }
-        } else {
+        } catch (err) {
+          console.error('Gemini Chat parsing error:', err);
           const fallback = fallbackMessageParser(text, clients, transactions);
+          botResponseText = fallback.replyText;
+          extractedDetails = { action: fallback.action };
+
           if (fallback.action === 'add_transaction' && fallback.transaction && fallback.transaction.amount) {
-            botResponseText = fallback.replyText;
-            extractedDetails = { action: fallback.action };
             const newTxObj: any = {
               id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
               businessId,
@@ -997,8 +1100,7 @@ Return ONLY valid JSON matching this schema:
             }
           }
         }
-      } catch (err) {
-        console.error('Gemini Chat parsing error:', err);
+      } else {
         const fallback = fallbackMessageParser(text, clients, transactions);
         botResponseText = fallback.replyText;
         extractedDetails = { action: fallback.action };
@@ -1020,67 +1122,49 @@ Return ONLY valid JSON matching this schema:
           }
         }
       }
-    } else {
-      const fallback = fallbackMessageParser(text, clients, transactions);
-      botResponseText = fallback.replyText;
-      extractedDetails = { action: fallback.action };
 
-      if (fallback.action === 'add_transaction' && fallback.transaction && fallback.transaction.amount) {
-        const newTxObj: any = {
-          id: 'tx_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
-          businessId,
-          currency: '₹',
-          date: new Date().toISOString().split('T')[0],
-          source: 'whatsapp',
-          createdAt: new Date().toISOString(),
-          ...fallback.transaction,
-        };
-        const txDoc = await TransactionModel.create(newTxObj);
-        createdTransaction = stripMongoFields<Transaction>(txDoc);
-        if (createdTransaction.clientName) {
-          await recalculateClientLedger(createdTransaction.clientName, businessId);
-        }
-      }
-    }
+      const botMessageDoc = await ChatMessageModel.create({
+        id: 'msg_b_' + Date.now(),
+        businessId,
+        sender: 'bot',
+        text: botResponseText,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        status: 'read',
+        type: createdTransaction ? 'transaction_confirmation' : 'text',
+        transactionData: createdTransaction || undefined,
+        extractedDetails,
+      });
+      const botMessage = stripMongoFields<ChatMessage>(botMessageDoc);
 
-    const botMessageDoc = await ChatMessageModel.create({
-      id: 'msg_b_' + Date.now(),
-      businessId,
-      sender: 'bot',
-      text: botResponseText,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      status: 'read',
-      type: createdTransaction ? 'transaction_confirmation' : 'text',
-      transactionData: createdTransaction || undefined,
-      extractedDetails,
+      res.json({
+        success: true,
+        userMessage,
+        botMessage,
+        transaction: createdTransaction,
+      });
     });
-    const botMessage = stripMongoFields<ChatMessage>(botMessageDoc);
-
-    res.json({
-      success: true,
-      userMessage,
-      botMessage,
-      transaction: createdTransaction,
-    });
-  });
 
   // API: Scan Receipt (Scoped by businessId)
-  app.post('/api/scan-receipt', async (req, res) => {
-    const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
-    const { imageBase64, mimeType = 'image/jpeg', autoSave = false } = req.body;
+  app.post(
+    '/api/scan-receipt',
+    authMiddleware,
+    businessMiddleware,
+    async (req: BusinessRequest, res) => {
+      const businessId = req.businessId!;
+      const { imageBase64, mimeType = 'image/jpeg', autoSave = false } = req.body;
 
-    if (!imageBase64) {
-      return res.status(400).json({ error: 'Image base64 data is required' });
-    }
+      if (!imageBase64) {
+        return res.status(400).json({ error: 'Image base64 data is required' });
+      }
 
-    const cleanBase64 = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
-    const gemini = getGeminiClient();
+      const cleanBase64 = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
+      const gemini = getGeminiClient();
 
-    let scanResult: ReceiptScanResult;
+      let scanResult: ReceiptScanResult;
 
-    if (gemini) {
-      try {
-        const prompt = `You are FinTrack's financial OCR scanning engine.
+      if (gemini) {
+        try {
+          const prompt = `You are FinTrack's financial OCR scanning engine.
 Analyze this receipt or UPI / digital payment screenshot (Google Pay, Paytm, PhonePe, Bank Transfer, Invoice, Retail bill).
 
 Extract the following data points with precision:
@@ -1113,128 +1197,132 @@ Return ONLY valid JSON matching this schema:
   ]
 }`;
 
-        const imagePart = {
-          inlineData: {
-            mimeType,
-            data: cleanBase64,
-          },
-        };
+          const imagePart = {
+            inlineData: {
+              mimeType,
+              data: cleanBase64,
+            },
+          };
 
-        const aiResponse = await gemini.models.generateContent({
-          model: 'gemini-3.7-flash',
-          contents: { parts: [imagePart, { text: prompt }] },
-          config: {
-            responseMimeType: 'application/json',
-          },
-        });
+          const aiResponse = await gemini.models.generateContent({
+            model: 'gemini-3.7-flash',
+            contents: { parts: [imagePart, { text: prompt }] },
+            config: {
+              responseMimeType: 'application/json',
+            },
+          });
 
-        const jsonStr = aiResponse.text?.trim() || '{}';
-        scanResult = JSON.parse(jsonStr);
-      } catch (err) {
-        console.error('Gemini receipt OCR error:', err);
+          const jsonStr = aiResponse.text?.trim() || '{}';
+          scanResult = JSON.parse(jsonStr);
+        } catch (err) {
+          console.error('Gemini receipt OCR error:', err);
+          scanResult = {
+            amount: 1450,
+            currency: '₹',
+            date: new Date().toISOString().split('T')[0],
+            merchantOrParty: 'Packaging Supply Mart',
+            category: 'Packaging',
+            type: 'expense',
+            paymentMethod: 'UPI',
+            referenceNumber: 'UPI/20260815/84920194',
+            taxAmount: 65,
+            rawSummary: 'UPI Payment of ₹1,450 to Packaging Supply Mart for bubble wrap and custom craft boxes.',
+            confidenceScore: 0.94,
+            items: [
+              { name: 'Cardboard Shipping Boxes (x50)', price: 950, quantity: 50 },
+              { name: 'Bubble Wrap Roll 100m', price: 500, quantity: 1 },
+            ],
+          };
+        }
+      } else {
         scanResult = {
-          amount: 1450,
+          amount: 2200,
           currency: '₹',
           date: new Date().toISOString().split('T')[0],
-          merchantOrParty: 'Packaging Supply Mart',
-          category: 'Packaging',
+          merchantOrParty: 'QuickPrint Studio',
+          category: 'Raw materials',
           type: 'expense',
           paymentMethod: 'UPI',
-          referenceNumber: 'UPI/20260815/84920194',
-          taxAmount: 65,
-          rawSummary: 'UPI Payment of ₹1,450 to Packaging Supply Mart for bubble wrap and custom craft boxes.',
-          confidenceScore: 0.94,
-          items: [
-            { name: 'Cardboard Shipping Boxes (x50)', price: 950, quantity: 50 },
-            { name: 'Bubble Wrap Roll 100m', price: 500, quantity: 1 },
-          ],
+          referenceNumber: 'UPI/20260815/99812401',
+          rawSummary: 'Payment of ₹2,200 for visiting cards and matte sticker printing.',
+          confidenceScore: 0.92,
+          items: [{ name: 'Sticker Printing & Cutting', price: 2200, quantity: 1 }],
         };
       }
-    } else {
-      scanResult = {
-        amount: 2200,
-        currency: '₹',
-        date: new Date().toISOString().split('T')[0],
-        merchantOrParty: 'QuickPrint Studio',
-        category: 'Raw materials',
-        type: 'expense',
-        paymentMethod: 'UPI',
-        referenceNumber: 'UPI/20260815/99812401',
-        rawSummary: 'Payment of ₹2,200 for visiting cards and matte sticker printing.',
-        confidenceScore: 0.92,
-        items: [{ name: 'Sticker Printing & Cutting', price: 2200, quantity: 1 }],
-      };
-    }
 
-    let savedTx: Transaction | null = null;
+      let savedTx: Transaction | null = null;
 
-    if (autoSave && scanResult.amount) {
-      const newTxObj: any = {
-        id: 'tx_scan_' + Date.now(),
-        businessId,
-        type: scanResult.type || 'expense',
-        amount: scanResult.amount,
-        currency: scanResult.currency || '₹',
-        clientName: scanResult.type === 'income' ? scanResult.merchantOrParty : undefined,
-        category: scanResult.category || 'Other business expenses',
-        description: scanResult.rawSummary || `${scanResult.merchantOrParty} (${scanResult.paymentMethod})`,
-        date: scanResult.date || new Date().toISOString().split('T')[0],
-        paymentMethod: scanResult.paymentMethod || 'UPI',
-        source: 'receipt_scan',
-        receiptImageBase64: `data:${mimeType};base64,${cleanBase64.substring(0, 100)}...`,
-        notes: `Ref: ${scanResult.referenceNumber || 'N/A'}. Extracted via Gemini OCR.`,
-        createdAt: new Date().toISOString(),
-      };
+      if (autoSave && scanResult.amount) {
+        const newTxObj: any = {
+          id: 'tx_scan_' + Date.now(),
+          businessId,
+          type: scanResult.type || 'expense',
+          amount: scanResult.amount,
+          currency: scanResult.currency || '₹',
+          clientName: scanResult.type === 'income' ? scanResult.merchantOrParty : undefined,
+          category: scanResult.category || 'Other business expenses',
+          description: scanResult.rawSummary || `${scanResult.merchantOrParty} (${scanResult.paymentMethod})`,
+          date: scanResult.date || new Date().toISOString().split('T')[0],
+          paymentMethod: scanResult.paymentMethod || 'UPI',
+          source: 'receipt_scan',
+          receiptImageBase64: `data:${mimeType};base64,${cleanBase64.substring(0, 100)}...`,
+          notes: `Ref: ${scanResult.referenceNumber || 'N/A'}. Extracted via Gemini OCR.`,
+          createdAt: new Date().toISOString(),
+        };
 
-      const savedDoc = await TransactionModel.create(newTxObj);
-      savedTx = stripMongoFields<Transaction>(savedDoc);
+        const savedDoc = await TransactionModel.create(newTxObj);
+        savedTx = stripMongoFields<Transaction>(savedDoc);
 
-      await ChatMessageModel.create({
-        id: 'msg_scan_' + Date.now(),
-        businessId,
-        sender: 'bot',
-        text: `📸 *Receipt Scanned & Recorded!*\n\n• *Amount:* ₹${savedTx.amount.toLocaleString('en-IN')}\n• *Party:* ${scanResult.merchantOrParty}\n• *Category:* ${savedTx.category}\n• *Payment:* ${savedTx.paymentMethod} (Ref: ${scanResult.referenceNumber || 'Verified'})\n• *Date:* ${savedTx.date}\n\n✅ *Record added to Expenses.*`,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        status: 'read',
-        type: 'transaction_confirmation',
-        transactionData: savedTx,
+        await ChatMessageModel.create({
+          id: 'msg_scan_' + Date.now(),
+          businessId,
+          sender: 'bot',
+          text: `📸 *Receipt Scanned & Recorded!*\n\n• *Amount:* ₹${savedTx.amount.toLocaleString('en-IN')}\n• *Party:* ${scanResult.merchantOrParty}\n• *Category:* ${savedTx.category}\n• *Payment:* ${savedTx.paymentMethod} (Ref: ${scanResult.referenceNumber || 'Verified'})\n• *Date:* ${savedTx.date}\n\n✅ *Record added to Expenses.*`,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          status: 'read',
+          type: 'transaction_confirmation',
+          transactionData: savedTx,
+        });
+      }
+
+      res.json({
+        success: true,
+        result: scanResult,
+        transaction: savedTx,
       });
-    }
-
-    res.json({
-      success: true,
-      result: scanResult,
-      transaction: savedTx,
     });
-  });
 
   // API: Generate WhatsApp Payment Reminder message
-  app.post('/api/generate-reminder', async (req, res) => {
-    const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
-    const { clientId, clientName } = req.body;
-    let client: Client | undefined = undefined;
+  app.post(
+    '/api/generate-reminder',
+    authMiddleware,
+    businessMiddleware,
+    async (req: BusinessRequest, res) => {
+      const businessId = req.businessId!;
+      const { clientId, clientName } = req.body;
+      let client: Client | undefined = undefined;
 
-    if (clientId) {
-      const doc = await ClientModel.findOne({ businessId, id: clientId }).lean();
-      if (doc) client = stripMongoFields<Client>(doc);
-    }
-    if (!client && clientName) {
-      const doc = await ClientModel.findOne({ businessId, name: { $regex: new RegExp(`^${clientName.trim()}$`, 'i') } }).lean();
-      if (doc) client = stripMongoFields<Client>(doc);
-    }
+      if (clientId) {
+        const doc = await ClientModel.findOne({ businessId, id: clientId }).lean();
+        if (doc) client = stripMongoFields<Client>(doc);
+      }
+      if (!client && clientName) {
+        const doc = await ClientModel.findOne({ businessId, name: { $regex: new RegExp(`^${clientName.trim()}$`, 'i') } }).lean();
+        if (doc) client = stripMongoFields<Client>(doc);
+      }
 
-    if (!client) {
-      return res.status(404).json({ error: 'Client not found' });
-    }
+      if (!client) {
+        return res.status(404).json({ error: 'Client not found' });
+      }
 
-    const gemini = getGeminiClient();
-    const businessDoc = await BusinessModel.findOne({ id: businessId }).lean();
-    const bInfo = businessDoc ? stripMongoFields<BusinessInfo>(businessDoc) : INITIAL_BUSINESS_INFO;
+      const gemini = getGeminiClient();
+      const businessDoc = await BusinessModel.findOne({ id: businessId }).lean();
+      const bInfo = businessDoc ? stripMongoFields<BusinessInfo>(businessDoc) : INITIAL_BUSINESS_INFO;
 
-    let reminderMessage = '';
-    if (gemini) {
-      try {
-        const prompt = `Draft a polite, professional, yet gentle WhatsApp payment reminder message from freelancer "${bInfo.ownerName}" (${bInfo.name}) to client "${client.name}".
+      let reminderMessage = '';
+      if (gemini) {
+        try {
+          const prompt = `Draft a polite, professional, yet gentle WhatsApp payment reminder message from freelancer "${bInfo.ownerName}" (${bInfo.name}) to client "${client.name}".
 Context details:
 - Client Company: ${client.company || 'N/A'}
 - Service: ${client.serviceCategory || 'Freelance Work'}
@@ -1246,34 +1334,34 @@ Context details:
 
 Write a clear WhatsApp message with bullet points and friendly tone. Max 4 paragraphs. Do not add metadata wrappers.`;
 
-        const aiRes = await gemini.models.generateContent({
-          model: 'gemini-3.7-flash',
-          contents: prompt,
-        });
+          const aiRes = await gemini.models.generateContent({
+            model: 'gemini-3.7-flash',
+            contents: prompt,
+          });
 
-        reminderMessage = aiRes.text?.trim() || '';
-      } catch (err) {
-        console.error('Gemini reminder generation error:', err);
+          reminderMessage = aiRes.text?.trim() || '';
+        } catch (err) {
+          console.error('Gemini reminder generation error:', err);
+        }
       }
-    }
 
-    if (!reminderMessage) {
-      reminderMessage = `Hi ${client.name}! 👋\n\nHope you are having a productive week!\n\nThis is a quick friendly check-in regarding the pending balance for *${client.serviceCategory}*.\n\n📌 *Invoice Summary:*\n• Total Billed: ₹${client.totalBilled.toLocaleString('en-IN')}\n• Amount Received: ₹${client.totalReceived.toLocaleString('en-IN')}\n• *Pending Outstanding: ₹${client.outstanding.toLocaleString('en-IN')}*\n• *Due Date:* ${client.dueDate || 'Soon'}\n\nYou can transfer directly via UPI to *${bInfo.upiId}* or reply here once paid.\n\nThank you!\n_${bInfo.ownerName} (${bInfo.name})_`;
-    }
+      if (!reminderMessage) {
+        reminderMessage = `Hi ${client.name}! 👋\n\nHope you are having a productive week!\n\nThis is a quick friendly check-in regarding the pending balance for *${client.serviceCategory}*.\n\n📌 *Invoice Summary:*\n• Total Billed: ₹${client.totalBilled.toLocaleString('en-IN')}\n• Amount Received: ₹${client.totalReceived.toLocaleString('en-IN')}\n• *Pending Outstanding: ₹${client.outstanding.toLocaleString('en-IN')}*\n• *Due Date:* ${client.dueDate || 'Soon'}\n\nYou can transfer directly via UPI to *${bInfo.upiId}* or reply here once paid.\n\nThank you!\n_${bInfo.ownerName} (${bInfo.name})_`;
+      }
 
-    const encodedText = encodeURIComponent(reminderMessage);
-    const cleanPhone = (client.phone || '').replace(/[^0-9]/g, '');
-    const whatsappWebUrl = `https://web.whatsapp.com/send?phone=${cleanPhone}&text=${encodedText}`;
-    const whatsappApiUrl = `https://api.whatsapp.com/send?phone=${cleanPhone}&text=${encodedText}`;
+      const encodedText = encodeURIComponent(reminderMessage);
+      const cleanPhone = (client.phone || '').replace(/[^0-9]/g, '');
+      const whatsappWebUrl = `https://web.whatsapp.com/send?phone=${cleanPhone}&text=${encodedText}`;
+      const whatsappApiUrl = `https://api.whatsapp.com/send?phone=${cleanPhone}&text=${encodedText}`;
 
-    res.json({
-      success: true,
-      client,
-      reminderMessage,
-      whatsappWebUrl,
-      whatsappApiUrl,
+      res.json({
+        success: true,
+        client,
+        reminderMessage,
+        whatsappWebUrl,
+        whatsappApiUrl,
+      });
     });
-  });
 
   // Serve Vite frontend during local development or static dist in production
   if (process.env.NODE_ENV !== 'production') {
@@ -1289,6 +1377,17 @@ Write a clear WhatsApp message with bullet points and friendly tone. Max 4 parag
       res.sendFile(path.resolve(distPath, 'index.html'));
     });
   }
+
+  // TEMP: Authentication middleware test
+  app.get('/api/auth-test', authMiddleware, async (req, res) => {
+    const authReq = req as AuthRequest;
+
+    return res.json({
+      success: true,
+      message: 'Authentication middleware working',
+      user: authReq.user,
+    });
+  });
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`FinTrack Server running on http://0.0.0.0:${PORT}`);
