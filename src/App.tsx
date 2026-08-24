@@ -28,23 +28,90 @@ export default function App() {
   const [reminderClient, setReminderClient] = useState<Client | null>(null);
   const [paymentClientForTx, setPaymentClientForTx] = useState<Client | null>(null);
 
-  // Fetch full data from server
+  // Authenticated API helper
+  const apiFetch = async (
+    url: string,
+    options: RequestInit = {}
+  ): Promise<Response> => {
+    const token = localStorage.getItem('fintrack_token');
+
+    const headers = new Headers(options.headers);
+
+    headers.set('Content-Type', 'application/json');
+
+    if (token) {
+      headers.set('Authorization', `Bearer ${token}`);
+    }
+
+    return fetch(url, {
+      ...options,
+      headers,
+    });
+  };
+
+  // Fetch all authenticated, business-scoped application data
   const fetchAppData = async () => {
+    console.log('[FRONTEND] fetchAppData() called');
+
     try {
-      const res = await fetch('/api/data');
-      if (res.ok) {
-        const data = await res.json();
-        if (data.transactions) setTransactions(data.transactions);
-        if (data.clients) setClients(data.clients);
-        if (data.chatMessages) setChatMessages(data.chatMessages);
-        if (data.businessInfo) setBusinessInfo(data.businessInfo);
+      const res = await apiFetch('/api/data');
+
+      console.log('[FRONTEND] /api/data status:', res.status);
+
+      if (!res.ok) {
+        const errorText = await res.text();
+        console.error('[FRONTEND] /api/data failed:', errorText);
+        return;
       }
-    } catch (e) {
-      console.warn('Using local data state', e);
+
+      const data = await res.json();
+
+      console.log('[FRONTEND] Application data received:', {
+        businessId: data.businessId,
+        transactions: data.transactions?.length,
+        clients: data.clients?.length,
+        chatMessages: data.chatMessages?.length,
+        businessName: data.businessInfo?.name,
+      });
+
+      console.log(
+        '[FRONTEND] Transaction types:',
+        data.transactions?.map((tx: any) => ({
+          id: tx.id,
+          amount: tx.amount,
+          type: tx.type,
+          category: tx.category,
+          source: tx.source,
+        }))
+      );
+
+      // Restore transactions
+      if (data.transactions) {
+        setTransactions(data.transactions);
+      }
+
+      // Restore clients
+      if (data.clients) {
+        setClients(data.clients);
+      }
+
+      // Restore WhatsApp chat history
+      if (data.chatMessages) {
+        setChatMessages(data.chatMessages);
+      }
+
+      // Restore business/profile information
+      if (data.businessInfo) {
+        setBusinessInfo(data.businessInfo);
+      }
+
+    } catch (error) {
+      console.error('[FRONTEND] Failed to fetch application data:', error);
     }
   };
 
   useEffect(() => {
+    console.log('[FRONTEND] App mounted - fetching data...');
     fetchAppData();
   }, []);
 
@@ -88,7 +155,7 @@ export default function App() {
   // Send message to WhatsApp Bot (Natural Language parsing & Q&A)
   const handleSendMessage = async (text: string) => {
     try {
-      const res = await fetch('/api/chat/message', {
+      const res = await apiFetch('/api/chat/message', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text }),
@@ -123,7 +190,7 @@ export default function App() {
   // Save manual transaction from modal
   const handleSaveTransaction = async (txData: any) => {
     try {
-      const res = await fetch('/api/transactions', {
+      const res = await apiFetch('/api/transactions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(txData),
@@ -143,7 +210,7 @@ export default function App() {
   const handleDeleteTransaction = async (id: string) => {
     if (!window.confirm('Delete this transaction record?')) return;
     try {
-      const res = await fetch(`/api/transactions/${id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/transactions/${id}`, { method: 'DELETE' });
       if (res.ok) {
         setTransactions((prev) => prev.filter((t) => t.id !== id));
         fetchAppData();
@@ -156,7 +223,7 @@ export default function App() {
   // Add / update client
   const handleAddOrUpdateClient = async (clientData: Partial<Client>) => {
     try {
-      const res = await fetch('/api/clients', {
+      const res = await apiFetch('/api/clients', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(clientData),
@@ -206,7 +273,7 @@ export default function App() {
   // Reset demo data
   const handleResetData = async () => {
     try {
-      const res = await fetch('/api/reset', { method: 'POST' });
+      const res = await apiFetch('/api/reset', { method: 'POST' });
       if (res.ok) {
         await fetchAppData();
       }
@@ -344,7 +411,7 @@ export default function App() {
         businessInfo={businessInfo}
         onSaveBusinessInfo={async (info) => {
           try {
-            const response = await fetch('/api/business', {
+            const response = await apiFetch('/api/business', {
               method: 'PUT',
               headers: {
                 'Content-Type': 'application/json',

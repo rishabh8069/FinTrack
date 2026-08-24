@@ -40,6 +40,7 @@ function getBusinessId(req: express.Request): string | null {
 }
 
 // Lazy / Safe Gemini initialization
+const GEMINI_MODEL = 'gemini-3.6-flash';
 function getGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -400,57 +401,75 @@ async function startServer() {
   app.use('/api/auth', authRouter);
 
   // API: Get Full Application Data (Scoped by businessId)
-  app.get('/api/data', async (req, res) => {
-    try {
-      const businessId = getBusinessId(req) || DEMO_BUSINESS_ID;
-      const data = await loadApplicationData(businessId);
-      const currentMonth = new Date().toISOString().slice(0, 7);
+  app.get(
+    '/api/data',
+    authMiddleware,
+    businessMiddleware,
+    async (req: BusinessRequest, res) => {
 
-      let totalIncome = 0;
-      let totalExpenses = 0;
-      const expenseByCategory: Record<string, number> = {};
-      const incomeByCategory: Record<string, number> = {};
+      try {
+        const businessId = req.businessId!;
 
-      data.transactions.forEach((tx) => {
-        if (tx.type === 'income' || tx.type === 'payment_received') {
-          totalIncome += tx.amount;
-          incomeByCategory[tx.category] = (incomeByCategory[tx.category] || 0) + tx.amount;
-        } else if (tx.type === 'expense') {
-          totalExpenses += tx.amount;
-          expenseByCategory[tx.category] = (expenseByCategory[tx.category] || 0) + tx.amount;
-        }
-      });
+        console.log('[DATA] Authenticated Business ID:', businessId);
 
-      const netProfit = totalIncome - totalExpenses;
-      const profitMargin = totalIncome > 0 ? (netProfit / totalIncome) * 100 : 0;
-      const totalOutstanding = data.clients.reduce((sum, c) => sum + c.outstanding, 0);
+        const data = await loadApplicationData(businessId);
 
-      const monthlySummary = {
-        month: currentMonth,
-        monthName: 'August 2026',
-        totalIncome,
-        totalExpenses,
-        netProfit,
-        profitMargin,
-        totalOutstanding,
-        expenseByCategory,
-        incomeByCategory,
-        transactionCount: data.transactions.length,
-      };
+        console.log('[DATA] Transactions:', data.transactions.length);
+        console.log(
+          '[DATA] Expenses:',
+          data.transactions.filter(tx => tx.type === 'expense').length
+        );
+        console.log('[DATA] Chats:', data.chatMessages.length);
+        console.log('[DATA] Business:', data.businessInfo?.name);
 
-      res.json({
-        businessId,
-        businessInfo: data.businessInfo,
-        clients: data.clients,
-        transactions: data.transactions,
-        chatMessages: data.chatMessages,
-        summary: monthlySummary,
-      });
-    } catch (error) {
-      console.error('Error in /api/data:', error);
-      res.status(500).json({ error: 'Failed to load application data' });
-    }
-  });
+
+        const currentMonth = new Date().toISOString().slice(0, 7);
+
+        let totalIncome = 0;
+        let totalExpenses = 0;
+        const expenseByCategory: Record<string, number> = {};
+        const incomeByCategory: Record<string, number> = {};
+
+        data.transactions.forEach((tx) => {
+          if (tx.type === 'income' || tx.type === 'payment_received') {
+            totalIncome += tx.amount;
+            incomeByCategory[tx.category] = (incomeByCategory[tx.category] || 0) + tx.amount;
+          } else if (tx.type === 'expense') {
+            totalExpenses += tx.amount;
+            expenseByCategory[tx.category] = (expenseByCategory[tx.category] || 0) + tx.amount;
+          }
+        });
+
+        const netProfit = totalIncome - totalExpenses;
+        const profitMargin = totalIncome > 0 ? (netProfit / totalIncome) * 100 : 0;
+        const totalOutstanding = data.clients.reduce((sum, c) => sum + c.outstanding, 0);
+
+        const monthlySummary = {
+          month: currentMonth,
+          monthName: 'August 2026',
+          totalIncome,
+          totalExpenses,
+          netProfit,
+          profitMargin,
+          totalOutstanding,
+          expenseByCategory,
+          incomeByCategory,
+          transactionCount: data.transactions.length,
+        };
+
+        res.json({
+          businessId,
+          businessInfo: data.businessInfo,
+          clients: data.clients,
+          transactions: data.transactions,
+          chatMessages: data.chatMessages,
+          summary: monthlySummary,
+        });
+      } catch (error) {
+        console.error('Error in /api/data:', error);
+        res.status(500).json({ error: 'Failed to load application data' });
+      }
+    });
 
   // API: Create New Business Profile (Always assigns a unique businessId on creation)
   app.post('/api/business', async (req, res) => {
@@ -796,6 +815,10 @@ async function startServer() {
       try {
         const { id } = req.params;
         const businessId = req.businessId!;
+        console.log('[DELETE TRANSACTION]');
+        console.log('Transaction ID:', id);
+        console.log('Authenticated Business ID:', businessId);
+
         const isObjectId = mongoose.Types.ObjectId.isValid(id);
         const query: any = isObjectId
           ? { businessId, $or: [{ id }, { _id: id }] }
@@ -934,24 +957,45 @@ async function startServer() {
       const { text } = req.body;
       const businessId = req.businessId!;
 
+      console.log('[CHAT] Route reached');
+      console.log('[CHAT] Business ID:', businessId);
+      console.log('[CHAT] Text:', req.body?.text);
+
       if (!text || !text.trim()) {
         return res.status(400).json({ error: 'Message text cannot be empty' });
       }
 
+      console.log('[CHAT] Loading application data...');
+
       const appData = await loadApplicationData(businessId);
+
+      console.log('[CHAT] Application data loaded');
+
       const { businessInfo, clients, transactions } = appData;
+
+      console.log('[CHAT] Creating user message...');
 
       const userMessageDoc = await ChatMessageModel.create({
         id: 'msg_u_' + Date.now(),
         businessId,
         sender: 'user',
         text: text.trim(),
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        timestamp: new Date().toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
         status: 'read',
       });
+
+      console.log('[CHAT] User message created');
+
       const userMessage = stripMongoFields<ChatMessage>(userMessageDoc);
 
+      console.log('[CHAT] Getting Gemini client...');
+
       const gemini = getGeminiClient();
+
+      console.log('[CHAT] Gemini client ready:', !!gemini);
 
       let botResponseText = '';
       let extractedDetails: ChatMessage['extractedDetails'] = undefined;
@@ -998,14 +1042,23 @@ Return ONLY valid JSON matching this schema:
   "replyText": "Formatted WhatsApp reply text"
 }`;
 
+          console.log('[CHAT] Sending request to Gemini...');
+          console.time('[CHAT] Gemini response time');
           const aiResponse = await gemini.models.generateContent({
-            model: 'gemini-3.7-flash',
+            model: GEMINI_MODEL,
             contents: prompt,
-            config: { responseMimeType: 'application/json' },
+            config: {
+              responseMimeType: 'application/json',
+            },
           });
+
+          console.timeEnd('[CHAT] Gemini response time');
+          console.log('[CHAT] Gemini response received');
 
           const jsonStr = aiResponse.text?.trim() || '{}';
           const parsed = JSON.parse(jsonStr);
+          console.log('[CHAT] Gemini JSON parsed');
+          console.log('[CHAT] Gemini action:', parsed.action);
 
           botResponseText = parsed.replyText || 'I processed your message.';
           extractedDetails = {
@@ -1017,6 +1070,7 @@ Return ONLY valid JSON matching this schema:
           };
 
           if (parsed.action === 'add_transaction' && parsed.transaction?.amount) {
+            console.log('[CHAT] Creating WhatsApp transaction...');
             const matchedClient = clients.find(
               (c) => parsed.transaction.clientName && c.name.toLowerCase().includes(parsed.transaction.clientName.toLowerCase())
             );
@@ -1036,6 +1090,8 @@ Return ONLY valid JSON matching this schema:
               source: 'whatsapp',
               createdAt: new Date().toISOString(),
             };
+
+            console.log('[CHAT] WhatsApp transaction created');
 
             const txDoc = await TransactionModel.create(newTxObj);
             createdTransaction = stripMongoFields<Transaction>(txDoc);
@@ -1123,6 +1179,7 @@ Return ONLY valid JSON matching this schema:
         }
       }
 
+      console.log('[CHAT] Creating bot message...');
       const botMessageDoc = await ChatMessageModel.create({
         id: 'msg_b_' + Date.now(),
         businessId,
@@ -1135,8 +1192,11 @@ Return ONLY valid JSON matching this schema:
         extractedDetails,
       });
       const botMessage = stripMongoFields<ChatMessage>(botMessageDoc);
+      console.log('[CHAT] Bot message created');
 
-      res.json({
+      console.log('[CHAT] Sending response...');
+
+      return res.status(200).json({
         success: true,
         userMessage,
         botMessage,
@@ -1205,8 +1265,16 @@ Return ONLY valid JSON matching this schema:
           };
 
           const aiResponse = await gemini.models.generateContent({
-            model: 'gemini-3.7-flash',
-            contents: { parts: [imagePart, { text: prompt }] },
+            model: GEMINI_MODEL,
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  { text: prompt },
+                  imagePart,
+                ],
+              },
+            ],
             config: {
               responseMimeType: 'application/json',
             },
