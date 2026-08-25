@@ -1,5 +1,9 @@
 import dotenv from 'dotenv';
 dotenv.config();
+console.log(
+  '[ENV] WhatsApp token:',
+  !!process.env.WHATSAPP_VERIFY_TOKEN
+);
 
 import express from 'express';
 import path from 'path';
@@ -20,6 +24,7 @@ import { ChatMessageModel } from './server/models/ChatMessage';
 import authRouter from './server/routes/auth';
 import { authMiddleware, AuthRequest } from './server/middleware/auth';
 import { businessMiddleware, BusinessRequest } from './server/middleware/business';
+import whatsappRouter from './server/routes/whatsapp';
 
 
 const __filename = fileURLToPath(import.meta.url);
@@ -399,6 +404,9 @@ async function startServer() {
 
   // Authentication routes
   app.use('/api/auth', authRouter);
+
+  //WhatsApp routes
+  app.use('/api/whatsapp', whatsappRouter);
 
   // API: Get Full Application Data (Scoped by businessId)
   app.get(
