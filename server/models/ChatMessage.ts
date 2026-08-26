@@ -11,7 +11,7 @@ export interface IChatMessage extends Document {
   imageUrl?: string;
   transactionData?: any;
   extractedDetails?: any;
-  status?: 'sent' | 'delivered' | 'read';
+  status?: 'sent' | 'delivered' | 'read' | 'received';
 }
 
 const chatMessageSchema = new Schema<IChatMessage>(
@@ -25,7 +25,10 @@ const chatMessageSchema = new Schema<IChatMessage>(
     imageUrl: String,
     transactionData: { type: Schema.Types.Mixed },
     extractedDetails: { type: Schema.Types.Mixed },
-    status: { type: String, enum: ['sent', 'delivered', 'read'] },
+    status: {
+      type: String,
+      enum: ['sent', 'delivered', 'read', 'received']
+    },
   },
   { versionKey: false }
 );

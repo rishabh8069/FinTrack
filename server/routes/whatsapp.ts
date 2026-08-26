@@ -10,6 +10,9 @@ import {
     formatTransactionConfirmation,
 } from '../services/transactionConfirmation';
 
+import { sendWhatsAppMessage } from '../services/whatsappService';
+import { ChatMessageModel } from '../models/ChatMessage';
+
 const router = Router();
 
 console.log(
@@ -126,7 +129,9 @@ router.post('/webhook', async (req: Request, res: Response) => {
                 }
 
                 for (const message of messages) {
+
                     const sender = message?.from;
+                    const whatsappMessageId = message?.id;
 
                     let text = '';
 
@@ -136,6 +141,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
 
                     console.log('[WHATSAPP] Message received');
                     console.log('[WHATSAPP] Sender:', sender);
+                    console.log('[WHATSAPP] Message ID:', whatsappMessageId);
                     console.log('[WHATSAPP] Type:', message?.type);
                     console.log('[WHATSAPP] Text:', text);
 
@@ -146,67 +152,155 @@ router.post('/webhook', async (req: Request, res: Response) => {
                         continue;
                     }
 
-                    console.log(
-                        '[WHATSAPP] Message successfully received by FinTrack'
-                    );
+                    // --------------------------------------------------
+                    // SAVE USER MESSAGE TO MONGODB
+                    // --------------------------------------------------
 
-                    // Parse the WhatsApp message using AI
-                    const parsed = await parseTransactionMessage(text);
+                    const businessId =
+                        process.env.WHATSAPP_BUSINESS_ID ||
+                        'business_demo';
 
-                    console.log(
-                        '[PARSER] Parsed transaction:',
-                        JSON.stringify(parsed, null, 2)
-                    );
+                    await ChatMessageModel.create({
+                        id: `chat_${Date.now()}_${Math.random()
+                            .toString(36)
+                            .substring(2, 8)}`,
 
-                    // Save transaction to MongoDB
-                    const businessId = process.env.WHATSAPP_BUSINESS_ID;
-
-                    if (!businessId) {
-                        throw new Error(
-                            'WHATSAPP_BUSINESS_ID is not configured'
-                        );
-                    }
-
-                    const saved = await saveParsedTransaction({
                         businessId,
-                        originalText: text,
-                        parsed,
-                        whatsappMessageId: message?.id,
+
+                        sender: 'user',
+
+                        text,
+
+                        timestamp: new Date().toISOString(),
+
+                        type: message?.type,
+
+                        status: 'received',
+
+                        transactionData: undefined,
+
+                        extractedDetails: undefined,
                     });
 
                     console.log(
-                        '[MONGODB] Persistence result:',
-                        JSON.stringify(saved, null, 2)
+                        '[MONGODB] User WhatsApp message saved'
                     );
 
                     // --------------------------------------------------
-                    // CONFIRMATION FLOW
+                    // CHECK PENDING TRANSACTION
                     // --------------------------------------------------
 
-                    const pendingTransaction = getPendingTransaction(sender);
+                    const pendingTransaction =
+                        getPendingTransaction(sender);
 
-                    // --------------------------------------------------
-                    // 1. USER IS CONFIRMING A PREVIOUS TRANSACTION
-                    // --------------------------------------------------
+                    // ==================================================
+                    // 1. YES / CONFIRMATION
+                    // ==================================================
 
-                    if (pendingTransaction && isConfirmation(text)) {
-                        console.log('[CONFIRMATION] User confirmed transaction');
+                    if (
+                        pendingTransaction &&
+                        isConfirmation(text)
+                    ) {
+
+                        console.log(
+                            '[CONFIRMATION] User confirmed transaction'
+                        );
+
+                        const transaction =
+                            pendingTransaction.transaction;
 
                         console.log(
                             '[CONFIRMATION] Transaction:',
                             JSON.stringify(
-                                pendingTransaction.transaction,
+                                transaction,
                                 null,
                                 2
                             )
                         );
 
-                        /*
-                         * MongoDB transaction creation will be implemented
-                         * after we verify the confirmation flow.
-                         */
+                        // ------------------------------------------------
+                        // SAVE TRANSACTION TO MONGODB
+                        // ------------------------------------------------
+
+                        const persistenceResult =
+                            await saveParsedTransaction({
+                                businessId,
+
+                                whatsappMessageId:
+                                    pendingTransaction.whatsappMessageId,
+
+                                originalText:
+                                    pendingTransaction.originalText,
+
+                                parsed: transaction,
+                            });
+
+                        console.log(
+                            '[MONGODB] Persistence result:',
+                            JSON.stringify(
+                                persistenceResult,
+                                null,
+                                2
+                            )
+                        );
 
                         clearPendingTransaction(sender);
+
+                        // ------------------------------------------------
+                        // SEND SUCCESS MESSAGE
+                        // ------------------------------------------------
+
+                        const successMessage =
+                            persistenceResult.saved
+                                ? '✅ Transaction recorded successfully!'
+                                : persistenceResult.duplicate
+                                    ? 'ℹ️ This transaction was already recorded.'
+                                    : '⚠️ I could not record this transaction.';
+
+                        const sendResult =
+                            await sendWhatsAppMessage(
+                                sender,
+                                successMessage
+                            );
+
+                        console.log(
+                            '[WHATSAPP] Confirmation response:',
+                            JSON.stringify(
+                                sendResult,
+                                null,
+                                2
+                            )
+                        );
+
+                        // ------------------------------------------------
+                        // SAVE BOT RESPONSE TO CHAT
+                        // ------------------------------------------------
+
+                        await ChatMessageModel.create({
+                            id: `chat_${Date.now()}_${Math.random()
+                                .toString(36)
+                                .substring(2, 8)}`,
+
+                            businessId,
+
+                            sender: 'bot',
+
+                            text: successMessage,
+
+                            timestamp:
+                                new Date().toISOString(),
+
+                            type: 'text',
+
+                            status: 'sent',
+
+                            transactionData:
+                                transaction,
+                        });
+
+                        console.log(
+                            '[MONGODB] Bot confirmation saved'
+                        );
 
                         console.log(
                             '[CONFIRMATION] Transaction confirmed successfully'
@@ -215,14 +309,69 @@ router.post('/webhook', async (req: Request, res: Response) => {
                         continue;
                     }
 
-                    // --------------------------------------------------
-                    // 2. USER IS REJECTING A PREVIOUS TRANSACTION
-                    // --------------------------------------------------
+                    // ==================================================
+                    // 2. NO / REJECTION
+                    // ==================================================
 
-                    if (pendingTransaction && isRejection(text)) {
-                        console.log('[CONFIRMATION] User rejected transaction');
+                    if (
+                        pendingTransaction &&
+                        isRejection(text)
+                    ) {
+
+                        console.log(
+                            '[CONFIRMATION] User rejected transaction'
+                        );
 
                         clearPendingTransaction(sender);
+
+                        const cancellationMessage =
+                            '❌ Transaction cancelled. Nothing was recorded.';
+
+                        // ------------------------------------------------
+                        // SEND CANCELLATION MESSAGE
+                        // ------------------------------------------------
+
+                        const sendResult =
+                            await sendWhatsAppMessage(
+                                sender,
+                                cancellationMessage
+                            );
+
+                        console.log(
+                            '[WHATSAPP] Cancellation response:',
+                            JSON.stringify(
+                                sendResult,
+                                null,
+                                2
+                            )
+                        );
+
+                        // ------------------------------------------------
+                        // SAVE BOT RESPONSE TO CHAT
+                        // ------------------------------------------------
+
+                        await ChatMessageModel.create({
+                            id: `chat_${Date.now()}_${Math.random()
+                                .toString(36)
+                                .substring(2, 8)}`,
+
+                            businessId,
+
+                            sender: 'bot',
+
+                            text: cancellationMessage,
+
+                            timestamp:
+                                new Date().toISOString(),
+
+                            type: 'text',
+
+                            status: 'sent',
+                        });
+
+                        console.log(
+                            '[MONGODB] Bot cancellation saved'
+                        );
 
                         console.log(
                             '[CONFIRMATION] Transaction cancelled'
@@ -231,46 +380,117 @@ router.post('/webhook', async (req: Request, res: Response) => {
                         continue;
                     }
 
-                    // --------------------------------------------------
-                    // 3. NEW MESSAGE → SEND TO AI PARSER
-                    // --------------------------------------------------
+                    // ==================================================
+                    // 3. NEW MESSAGE → AI PARSER
+                    // ==================================================
 
-                    console.log('[PARSER] Parsing WhatsApp message...');
+                    console.log(
+                        '[PARSER] Parsing WhatsApp message...'
+                    );
 
-                    const parsedTransaction = await parseTransactionMessage(text);
+                    const parsedTransaction =
+                        await parseTransactionMessage(text);
 
                     console.log(
                         '[PARSER] Result:',
-                        JSON.stringify(parsedTransaction, null, 2)
+                        JSON.stringify(
+                            parsedTransaction,
+                            null,
+                            2
+                        )
                     );
 
-                    // --------------------------------------------------
-                    // 4. IF IT IS A TRANSACTION → CREATE PENDING STATE
-                    // --------------------------------------------------
+                    // ==================================================
+                    // 4. TRANSACTION DETECTED
+                    // ==================================================
 
                     if (parsedTransaction.isTransaction) {
+
                         createPendingTransaction(
                             sender,
-                            parsedTransaction
+                            parsedTransaction,
+                            message.id,
+                            text
                         );
-
                         const confirmationMessage =
                             formatTransactionConfirmation(
                                 parsedTransaction
                             );
 
                         console.log(
-                            '[CONFIRMATION] Confirmation message:'
+                            '[CONFIRMATION] Sending confirmation message to:',
+                            sender
                         );
 
-                        console.log(confirmationMessage);
+                        await sendWhatsAppMessage(
+                            sender,
+                            confirmationMessage
+                        );
+
+                        console.log(
+                            '[CONFIRMATION] Confirmation message sent successfully'
+                        );
+
+                        continue;
+
+                        // ------------------------------------------------
+                        // SEND CONFIRMATION TO WHATSAPP
+                        // ------------------------------------------------
+
+                        const sendResult =
+                            await sendWhatsAppMessage(
+                                sender,
+                                confirmationMessage
+                            );
+
+                        console.log(
+                            '[WHATSAPP] Confirmation sent:',
+                            JSON.stringify(
+                                sendResult,
+                                null,
+                                2
+                            )
+                        );
+
+                        // ------------------------------------------------
+                        // SAVE BOT CONFIRMATION TO MONGODB
+                        // ------------------------------------------------
+
+                        await ChatMessageModel.create({
+                            id: `chat_${Date.now()}_${Math.random()
+                                .toString(36)
+                                .substring(2, 8)}`,
+
+                            businessId,
+
+                            sender: 'bot',
+
+                            text: confirmationMessage,
+
+                            timestamp:
+                                new Date().toISOString(),
+
+                            type: 'text',
+
+                            status: 'sent',
+
+                            transactionData:
+                                parsedTransaction,
+
+                            extractedDetails:
+                                parsedTransaction,
+                        });
+
+                        console.log(
+                            '[MONGODB] Bot confirmation saved'
+                        );
 
                         continue;
                     }
 
-                    // --------------------------------------------------
+                    // ==================================================
                     // 5. NOT A TRANSACTION
-                    // --------------------------------------------------
+                    // ==================================================
 
                     console.log(
                         '[PARSER] Message is not a transaction'
@@ -282,12 +502,48 @@ router.post('/webhook', async (req: Request, res: Response) => {
         return res.sendStatus(200);
 
     } catch (error) {
+
         console.error(
             '[WHATSAPP] Error processing webhook:',
             error
         );
 
+        // Always acknowledge WhatsApp webhook
         return res.sendStatus(200);
+    }
+});
+
+
+router.post('/test-send', async (req: Request, res: Response) => {
+    try {
+        const { phone, message } = req.body;
+
+        if (!phone || !message) {
+            return res.status(400).json({
+                success: false,
+                message: 'phone and message are required',
+            });
+        }
+
+        const result = await sendWhatsAppMessage(
+            phone,
+            message
+        );
+
+        return res.status(
+            result.success ? 200 : 500
+        ).json(result);
+
+    } catch (error) {
+        console.error(
+            '[WHATSAPP] Test send failed:',
+            error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message: 'Failed to send WhatsApp message',
+        });
     }
 });
 
