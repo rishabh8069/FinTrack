@@ -42,19 +42,60 @@ export async function connectDatabase() {
 }
 
 export async function loadApplicationData(targetBusinessId: string = DEMO_BUSINESS_ID) {
-  let business = await BusinessModel.findOne({ id: targetBusinessId }).lean();
+  const bizQuery = { $regex: new RegExp(`^${targetBusinessId.trim()}$`, 'i') };
+
+  let business = await BusinessModel.findOne({ id: bizQuery }).lean();
 
   if (!business && targetBusinessId === DEMO_BUSINESS_ID) {
     await seedDatabase();
-    business = await BusinessModel.findOne({ id: DEMO_BUSINESS_ID }).lean();
+    business = await BusinessModel.findOne({ id: bizQuery }).lean();
   }
 
   const [businessDoc, clientDocs, transactionDocs, chatDocs] = await Promise.all([
-    BusinessModel.findOne({ id: targetBusinessId }).lean(),
-    ClientModel.find({ businessId: targetBusinessId }).sort({ id: 1 }).lean(),
-    TransactionModel.find({ businessId: targetBusinessId }).sort({ createdAt: -1 }).lean(),
-    ChatMessageModel.find({ businessId: targetBusinessId }).sort({ _id: 1 }).lean(),
+    BusinessModel.findOne({ id: bizQuery }).lean(),
+    ClientModel.find({ businessId: bizQuery }).sort({ id: 1 }).lean(),
+    TransactionModel.find({ businessId: bizQuery }).sort({ createdAt: -1 }).lean(),
+    ChatMessageModel.find({ businessId: bizQuery, channel: { $ne: 'whatsapp_app' } }).sort({ _id: 1 }).lean(),
   ]);
+
+  console.log(
+    '[DATA DEBUG] Target Business ID:',
+    targetBusinessId
+  );
+
+  console.log(
+    '[DATA DEBUG] Total transactions fetched:',
+    transactionDocs.length
+  );
+
+  console.log(
+    '[DATA DEBUG] Latest transactions:',
+    transactionDocs.slice(0, 5).map((tx) => ({
+      id: tx.id,
+      businessId: tx.businessId,
+      amount: tx.amount,
+      type: tx.type,
+      category: tx.category,
+      source: tx.source,
+      createdAt: tx.createdAt,
+    }))
+  );
+
+  console.log(
+    '[DATA DEBUG] WhatsApp transactions fetched:',
+    transactionDocs
+      .filter((tx) => tx.source === 'whatsapp')
+      .slice(0, 5)
+      .map((tx) => ({
+        id: tx.id,
+        businessId: tx.businessId,
+        amount: tx.amount,
+        type: tx.type,
+        category: tx.category,
+        source: tx.source,
+        createdAt: tx.createdAt,
+      }))
+  );
 
   const defaultBInfo: BusinessInfo = {
     name: 'My Business',

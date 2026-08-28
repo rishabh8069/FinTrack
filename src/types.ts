@@ -91,6 +91,7 @@ export interface ChatMessage {
     type?: TransactionType;
     summary?: string;
   };
+  channel?: 'dashboard' | 'whatsapp_app';
   status?: 'sent' | 'delivered' | 'read';
 }
 

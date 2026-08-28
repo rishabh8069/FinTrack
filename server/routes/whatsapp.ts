@@ -12,6 +12,7 @@ import {
 
 import { sendWhatsAppMessage } from '../services/whatsappService';
 import { ChatMessageModel } from '../models/ChatMessage';
+import { UserModel } from '../models/User';
 
 const router = Router();
 
@@ -153,10 +154,22 @@ router.post('/webhook', async (req: Request, res: Response) => {
                     }
 
                     // --------------------------------------------------
-                    // SAVE USER MESSAGE TO MONGODB
+                    // DYNAMICALLY RESOLVE BUSINESS ID FOR SENDER
                     // --------------------------------------------------
+                    const cleanPhone = sender.replace(/[^0-9]/g, '');
+                    const last10 = cleanPhone.slice(-10);
+
+                    const matchedUser = await UserModel.findOne({
+                        $or: [
+                            { whatsappNumber: sender },
+                            { whatsappNumber: cleanPhone },
+                            { whatsappNumber: `+${cleanPhone}` },
+                            { whatsappNumber: { $regex: `${last10}$` } },
+                        ],
+                    }).lean();
 
                     const businessId =
+                        matchedUser?.businessId ||
                         process.env.WHATSAPP_BUSINESS_ID ||
                         'business_demo';
 
@@ -166,6 +179,8 @@ router.post('/webhook', async (req: Request, res: Response) => {
                             .substring(2, 8)}`,
 
                         businessId,
+
+                        channel: 'whatsapp_app',
 
                         sender: 'user',
 
@@ -283,6 +298,8 @@ router.post('/webhook', async (req: Request, res: Response) => {
 
                             businessId,
 
+                            channel: 'whatsapp_app',
+
                             sender: 'bot',
 
                             text: successMessage,
@@ -356,6 +373,8 @@ router.post('/webhook', async (req: Request, res: Response) => {
                                 .substring(2, 8)}`,
 
                             businessId,
+
+                            channel: 'whatsapp_app',
 
                             sender: 'bot',
 
@@ -462,6 +481,8 @@ router.post('/webhook', async (req: Request, res: Response) => {
                                 .substring(2, 8)}`,
 
                             businessId,
+
+                            channel: 'whatsapp_app',
 
                             sender: 'bot',
 

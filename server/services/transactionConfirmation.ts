@@ -3,6 +3,8 @@ import { ParsedTransaction } from './transactionParser';
 interface PendingTransaction {
     phoneNumber: string;
     transaction: ParsedTransaction;
+    whatsappMessageId?: string;
+    originalText?: string;
     createdAt: number;
 }
 
@@ -10,11 +12,15 @@ const pendingTransactions = new Map<string, PendingTransaction>();
 
 export const createPendingTransaction = (
     phoneNumber: string,
-    transaction: ParsedTransaction
+    transaction: ParsedTransaction,
+    whatsappMessageId?: string,
+    originalText?: string
 ) => {
     pendingTransactions.set(phoneNumber, {
         phoneNumber,
         transaction,
+        whatsappMessageId,
+        originalText,
         createdAt: Date.now(),
     });
 

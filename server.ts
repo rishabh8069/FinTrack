@@ -416,9 +416,16 @@ async function startServer() {
     async (req: BusinessRequest, res) => {
 
       try {
+        console.log('[DASHBOARD] Business ID from JWT:', req.businessId);
         const businessId = req.businessId!;
 
         console.log('[DATA] Authenticated Business ID:', businessId);
+
+        console.log('[DATA] JWT Business ID:', req.businessId);
+        console.log(
+          '[DATA] WhatsApp Business ID:',
+          process.env.WHATSAPP_BUSINESS_ID
+        );
 
         const data = await loadApplicationData(businessId);
 
@@ -986,6 +993,7 @@ async function startServer() {
       const userMessageDoc = await ChatMessageModel.create({
         id: 'msg_u_' + Date.now(),
         businessId,
+        channel: 'dashboard',
         sender: 'user',
         text: text.trim(),
         timestamp: new Date().toLocaleTimeString([], {
@@ -1191,6 +1199,7 @@ Return ONLY valid JSON matching this schema:
       const botMessageDoc = await ChatMessageModel.create({
         id: 'msg_b_' + Date.now(),
         businessId,
+        channel: 'dashboard',
         sender: 'bot',
         text: botResponseText,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
