@@ -11,14 +11,30 @@ import { PaymentReminderModal } from './components/PaymentReminderModal';
 import { NewTransactionModal } from './components/NewTransactionModal';
 import { SettingsModal } from './components/SettingsModal';
 import { Transaction, Client, ChatMessage, MonthlySummary, ReceiptScanResult } from './types';
-import { INITIAL_BUSINESS_INFO, INITIAL_CLIENTS, INITIAL_TRANSACTIONS, INITIAL_CHAT_MESSAGES } from './data/initialData';
+import { INITIAL_BUSINESS_INFO } from './data/initialData';
+import { AuthScreen } from './components/AuthScreen';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<string>('dashboard');
-  const [transactions, setTransactions] = useState<Transaction[]>(INITIAL_TRANSACTIONS);
-  const [clients, setClients] = useState<Client[]>(INITIAL_CLIENTS);
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(INITIAL_CHAT_MESSAGES);
-  const [businessInfo, setBusinessInfo] = useState(INITIAL_BUSINESS_INFO);
+
+  const [authStatus, setAuthStatus] = useState<
+    'checking' | 'authenticated' | 'unauthenticated'
+  >('checking');
+
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
+
+  const [clients, setClients] = useState<Client[]>([]);
+
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+
+  const [businessInfo, setBusinessInfo] = useState({
+    ...INITIAL_BUSINESS_INFO,
+    name: '',
+    ownerName: '',
+    phone: '',
+    upiId: '',
+  });
+
   const [isLoading, setIsLoading] = useState(false);
 
   // Modals state
@@ -59,9 +75,18 @@ export default function App() {
       console.log('[FRONTEND] /api/data status:', res.status);
 
       if (!res.ok) {
+
         const errorText = await res.text();
+
         console.error('[FRONTEND] /api/data failed:', errorText);
+
+        if (res.status === 401) {
+          localStorage.removeItem('fintrack_token');
+          setAuthStatus('unauthenticated');
+        }
+
         return;
+
       }
 
       const data = await res.json();
@@ -111,9 +136,108 @@ export default function App() {
   };
 
   useEffect(() => {
-    console.log('[FRONTEND] App mounted - fetching data...');
-    fetchAppData();
+
+    const validateSession = async () => {
+
+      const token = localStorage.getItem('fintrack_token');
+
+      if (!token) {
+        setAuthStatus('unauthenticated');
+        return;
+      }
+
+      try {
+
+        console.log('[AUTH] Validating existing session...');
+
+        const response = await fetch('/api/auth/auth-test', {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+
+        if (response.status === 401 || response.status === 403) {
+
+          localStorage.removeItem('fintrack_token');
+
+          setAuthStatus('unauthenticated');
+
+          return;
+        }
+
+        if (!response.ok) {
+          throw new Error('Unable to validate authentication session.');
+        }
+
+        console.log('[AUTH] Session validated successfully.');
+
+        setAuthStatus('authenticated');
+
+        await fetchAppData();
+
+      } catch (error) {
+
+        console.error('[AUTH] Session validation failed:', error);
+
+        // Keep the stored token if this was a network/server error.
+        // The user can retry authentication after the server is available.
+        setAuthStatus('unauthenticated');
+
+      }
+
+    };
+
+    validateSession();
+
   }, []);
+
+  const handleAuthenticated = (token: string, user: any) => {
+
+    console.log('[AUTH] User authenticated:', user._id);
+
+    localStorage.setItem('fintrack_token', token);
+
+    setAuthStatus('authenticated');
+
+    fetchAppData();
+
+  };
+
+
+  const handleLogout = () => {
+    console.log('[AUTH] Logging out user...');
+
+    // Remove the stored authentication token
+    localStorage.removeItem('fintrack_token');
+
+    // Clear user-specific application data
+    setTransactions([]);
+    setClients([]);
+    setChatMessages([]);
+
+    setBusinessInfo({
+      ...INITIAL_BUSINESS_INFO,
+      name: '',
+      ownerName: '',
+      phone: '',
+      upiId: '',
+    });
+
+    // Reset dashboard navigation and modal states
+    setActiveTab('dashboard');
+    setIsNewTxOpen(false);
+    setIsScannerOpen(false);
+    setIsSettingsOpen(false);
+    setReminderClient(null);
+    setPaymentClientForTx(null);
+
+    // Return to authentication screen
+    setAuthStatus('unauthenticated');
+
+    console.log('[AUTH] User logged out successfully.');
+  };
+
 
   // Compute live summary from state
   const calculateMonthlySummary = (): MonthlySummary => {
@@ -282,6 +406,36 @@ export default function App() {
     }
   };
 
+  if (authStatus === 'checking') {
+
+    return (
+      <div className="min-h-screen bg-[#FDFBF7] flex items-center justify-center">
+
+        <div className="text-center">
+
+          <h1 className="text-3xl font-serif font-bold text-[#2C3327]">
+            FinTrack
+          </h1>
+
+          <p className="text-sm text-[#8C867A] mt-3">
+            Checking your account...
+          </p>
+
+        </div>
+
+      </div>
+    );
+
+  }
+
+  if (authStatus === 'unauthenticated') {
+
+    return (
+      <AuthScreen onAuthenticated={handleAuthenticated} />
+    );
+
+  }
+
   return (
     <div className="min-h-screen bg-[#FDFBF7] text-[#3D3D3D] flex flex-col font-sans selection:bg-[#5F6F52] selection:text-white">
       {/* Top Navigation */}
@@ -294,6 +448,7 @@ export default function App() {
         }}
         onOpenScanner={() => setIsScannerOpen(true)}
         onOpenSettings={() => setIsSettingsOpen(true)}
+        onLogout={handleLogout}
         businessName={businessInfo.name}
       />
 

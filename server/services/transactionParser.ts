@@ -115,7 +115,15 @@ Do not invent information.
                     : 0,
         };
     } catch (error) {
-        console.error('[PARSER] Failed to parse transaction:', error);
+        console.error(
+            '[PARSER] Failed to parse transaction:',
+            JSON.stringify(error, null, 2)
+        );
+
+        console.error(
+            '[PARSER] Raw error:',
+            error
+        );
 
         return {
             isTransaction: false,

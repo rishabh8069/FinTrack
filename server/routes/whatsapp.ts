@@ -260,64 +260,85 @@ router.post('/webhook', async (req: Request, res: Response) => {
                         );
 
                         clearPendingTransaction(sender);
-
                         // ------------------------------------------------
                         // SEND SUCCESS MESSAGE
                         // ------------------------------------------------
 
-                        const successMessage =
-                            persistenceResult.saved
-                                ? '✅ Transaction recorded successfully!'
-                                : persistenceResult.duplicate
-                                    ? 'ℹ️ This transaction was already recorded.'
-                                    : '⚠️ I could not record this transaction.';
+                        const dashboardUrl =
+                            process.env.DASHBOARD_URL || 'http://localhost:3000';
 
-                        const sendResult =
-                            await sendWhatsAppMessage(
-                                sender,
-                                successMessage
-                            );
+                        let successMessage = '';
+
+                        if (persistenceResult.saved) {
+                            successMessage =
+                                `✅ Transaction recorded successfully!\n\n` +
+                                `Amount: ₹${transaction.amount ?? 'Not specified'}\n` +
+                                `${transaction.clientName ? `Client: ${transaction.clientName}\n` : ''}` +
+                                `Category: ${transaction.category || 'Not specified'}\n` +
+                                `Description: ${transaction.description || 'Not specified'}\n\n` +
+                                `📊 Open your FinTrack dashboard:\n` +
+                                `${dashboardUrl}`;
+                        } else if (persistenceResult.duplicate) {
+                            successMessage =
+                                `ℹ️ This transaction was already recorded.\n\n` +
+                                `📊 Open your FinTrack dashboard:\n` +
+                                `${dashboardUrl}`;
+                        } else {
+                            successMessage =
+                                `⚠️ I could not record this transaction.\n\n` +
+                                `Please try again.`;
+                        }
+
+                        // ------------------------------------------------
+                        // SEND MESSAGE TO WHATSAPP
+                        // ------------------------------------------------
+
+                        const sendResult = await sendWhatsAppMessage(
+                            sender,
+                            successMessage
+                        );
 
                         console.log(
                             '[WHATSAPP] Confirmation response:',
-                            JSON.stringify(
-                                sendResult,
-                                null,
-                                2
-                            )
+                            JSON.stringify(sendResult, null, 2)
                         );
 
                         // ------------------------------------------------
                         // SAVE BOT RESPONSE TO CHAT
                         // ------------------------------------------------
 
-                        await ChatMessageModel.create({
-                            id: `chat_${Date.now()}_${Math.random()
-                                .toString(36)
-                                .substring(2, 8)}`,
+                        if (sendResult.success) {
+                            await ChatMessageModel.create({
+                                id: `chat_${Date.now()}_${Math.random()
+                                    .toString(36)
+                                    .substring(2, 8)}`,
 
-                            businessId,
+                                businessId,
 
-                            channel: 'whatsapp_app',
+                                channel: 'whatsapp_app',
 
-                            sender: 'bot',
+                                sender: 'bot',
 
-                            text: successMessage,
+                                text: successMessage,
 
-                            timestamp:
-                                new Date().toISOString(),
+                                timestamp: new Date().toISOString(),
 
-                            type: 'text',
+                                type: 'text',
 
-                            status: 'sent',
+                                status: 'sent',
 
-                            transactionData:
-                                transaction,
-                        });
+                                transactionData: transaction,
+                            });
 
-                        console.log(
-                            '[MONGODB] Bot confirmation saved'
-                        );
+                            console.log(
+                                '[MONGODB] Bot confirmation saved'
+                            );
+                        } else {
+                            console.error(
+                                '[WHATSAPP] Failed to send confirmation message:',
+                                sendResult.error
+                            );
+                        }
 
                         console.log(
                             '[CONFIRMATION] Transaction confirmed successfully'
@@ -425,12 +446,21 @@ router.post('/webhook', async (req: Request, res: Response) => {
 
                     if (parsedTransaction.isTransaction) {
 
+                        // ------------------------------------------------
+                        // CREATE PENDING TRANSACTION
+                        // ------------------------------------------------
+
                         createPendingTransaction(
                             sender,
                             parsedTransaction,
                             message.id,
                             text
                         );
+
+                        // ------------------------------------------------
+                        // CREATE CONFIRMATION MESSAGE
+                        // ------------------------------------------------
+
                         const confirmationMessage =
                             formatTransactionConfirmation(
                                 parsedTransaction
@@ -440,17 +470,6 @@ router.post('/webhook', async (req: Request, res: Response) => {
                             '[CONFIRMATION] Sending confirmation message to:',
                             sender
                         );
-
-                        await sendWhatsAppMessage(
-                            sender,
-                            confirmationMessage
-                        );
-
-                        console.log(
-                            '[CONFIRMATION] Confirmation message sent successfully'
-                        );
-
-                        continue;
 
                         // ------------------------------------------------
                         // SEND CONFIRMATION TO WHATSAPP
@@ -463,7 +482,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
                             );
 
                         console.log(
-                            '[WHATSAPP] Confirmation sent:',
+                            '[WHATSAPP] Confirmation response:',
                             JSON.stringify(
                                 sendResult,
                                 null,
@@ -472,38 +491,52 @@ router.post('/webhook', async (req: Request, res: Response) => {
                         );
 
                         // ------------------------------------------------
-                        // SAVE BOT CONFIRMATION TO MONGODB
+                        // SAVE BOT CONFIRMATION TO CHAT
                         // ------------------------------------------------
 
-                        await ChatMessageModel.create({
-                            id: `chat_${Date.now()}_${Math.random()
-                                .toString(36)
-                                .substring(2, 8)}`,
+                        if (sendResult.success) {
 
-                            businessId,
+                            await ChatMessageModel.create({
+                                id: `chat_${Date.now()}_${Math.random()
+                                    .toString(36)
+                                    .substring(2, 8)}`,
 
-                            channel: 'whatsapp_app',
+                                businessId,
 
-                            sender: 'bot',
+                                channel: 'whatsapp_app',
 
-                            text: confirmationMessage,
+                                sender: 'bot',
 
-                            timestamp:
-                                new Date().toISOString(),
+                                text: confirmationMessage,
 
-                            type: 'text',
+                                timestamp:
+                                    new Date().toISOString(),
 
-                            status: 'sent',
+                                type: 'text',
 
-                            transactionData:
-                                parsedTransaction,
+                                status: 'sent',
 
-                            extractedDetails:
-                                parsedTransaction,
-                        });
+                                transactionData:
+                                    parsedTransaction,
+
+                                extractedDetails:
+                                    parsedTransaction,
+                            });
+
+                            console.log(
+                                '[MONGODB] Bot confirmation saved'
+                            );
+
+                        } else {
+
+                            console.error(
+                                '[WHATSAPP] Failed to send confirmation:',
+                                sendResult.error
+                            );
+                        }
 
                         console.log(
-                            '[MONGODB] Bot confirmation saved'
+                            '[CONFIRMATION] Waiting for YES/NO response'
                         );
 
                         continue;
